@@ -87,6 +87,7 @@ class OnCuePlugin(Star):
         self.card_cache: dict[str, dict] = {}
         self.card_fail_until: dict[str, float] = {}
         self.card_op_lock = asyncio.Lock()
+        self.condense_prompt_warned = False
 
     async def initialize(self) -> None:
         try:
@@ -120,7 +121,7 @@ class OnCuePlugin(Star):
             value = None
         if value is not None:
             return value
-        for section in ("config_wake", "config_decision", "config_trigger", "config_character"):
+        for section in ("config_wake", "config_decision", "config_condense", "config_trigger", "config_character"):
             try:
                 obj = self.config.get(section, {})
             except Exception:
@@ -200,13 +201,15 @@ class OnCuePlugin(Star):
 
     async def _decision_card(self, umo: str, platform_name: str = "") -> str:
         raw = await self._character_card(umo, platform_name)
-        mode = self._cfg_str("decision_card_mode", "condense")
+        mode = self._cfg_str("decision_card_mode", "raw")
         max_chars = max(200, self._cfg_int("decision_card_max_chars", 1000))
         if mode != "condense" or not raw.strip():
             return raw
         condense_prompt = self._cfg_str("decision_card_condense_prompt")
         if "{raw_card}" not in condense_prompt:
-            logger.error("[OnCue] 已选择自动浓缩，但浓缩提示词为空或缺少 {raw_card}，本次直接使用原始角色卡")
+            if not self.condense_prompt_warned:
+                self.condense_prompt_warned = True
+                logger.error("[OnCue] 已选择自动浓缩，但浓缩提示词为空或缺少 {raw_card}，本次及后续直接使用原始角色卡")
             return raw
         key = self._card_key(condense_prompt + "\n" + str(max_chars) + "\n" + raw)
         cached = self.card_cache.get(key)
@@ -552,7 +555,7 @@ class OnCuePlugin(Star):
             resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
             return resp.completion_text or ""
         except Exception as e:
-            logger.error(f"[OnCue] 决策 LLM 调用失败: {e}")
+            logger.error(f"[OnCue] 决策 LLM 调用失败，本次按沉默处理: {e}")
             return ""
 
     def _parse_decision(self, raw: str) -> dict:
