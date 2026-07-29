@@ -4,7 +4,7 @@ author: POINTER
 version: 0.1.0
 description: 赋予 Bot 自由水群的能力！模拟真实的人类网聊思维！本插件为群聊专用的决策层，主要优化了角色扮演的场景。维护两态纯推导状态机和滚动群聊缓存，在被@或者点名时强制唤醒，在观测窗、复读或密集触发边命中时让角色自己决定是否开口，并把"回复决策/心情"作为舞台指令注入主提示词。
 short_desc: Roleplay group-chat decision layer for AstrBot.
-repo: "https://github.com/jin6yang"
+repo: "https://github.com/jin6yang/astrbot_plugin_soul_on_cue"
 astrbot_version: ">=4.5.7"
 support_platforms:
   - aiocqhttp
