@@ -39,9 +39,10 @@ DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请�
 3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静
 4. 只有 [图片]/表情包且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静（[图片] 只代表群里有人活动，不是开口理由）
 5. 有任何犹豫 → 保持安静
+6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空
 
 只输出 JSON，不要输出其它内容：
-{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由"}"""
+{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由", "need_kb": true或false, "kb_query": "需要时填独立检索词"}"""
 
 GLANCE_GENERATE_PROMPT = """你要以群聊角色的身份自然开口说一句话。
 
@@ -88,6 +89,8 @@ class OnCuePlugin(Star):
         self.card_fail_until: dict[str, float] = {}
         self.card_op_lock = asyncio.Lock()
         self.condense_prompt_warned = False
+        self.kb_missing_warned = False
+        self.kb_not_taken_warned = False
 
     async def initialize(self) -> None:
         try:
@@ -312,6 +315,8 @@ class OnCuePlugin(Star):
             prompt = await self._build_prompt(chat, "你刚忙完自己的事，顺手瞄了一眼群聊。", chat_id, chat_id.split(":", 1)[0])
             raw = await self._llm_decision(chat_id, prompt)
             decision = self._parse_decision(raw)
+            if decision["should_reply"] and decision.get("need_kb"):
+                decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
             if not decision["should_reply"]:
                 mult = self._trigger_reject(chat, "glance", now)
                 cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
@@ -359,6 +364,56 @@ class OnCuePlugin(Star):
             await conv_mgr.update_conversation(umo, cid, history=history)
         except Exception as e:
             logger.error(f"[OnCue] GLANCE 写入历史失败: {e}")
+
+    def _kb_plugin(self):
+        try:
+            md = self.context.get_registered_star("astrbot_plugin_external_knowledgebase")
+        except Exception:
+            md = None
+        if not md or not getattr(md, "activated", True):
+            return None
+        return getattr(md, "star_cls", None)
+
+    def _kb_available(self) -> bool:
+        plugin = self._kb_plugin()
+        if not plugin:
+            return False
+        try:
+            return bool(
+                callable(getattr(plugin, "is_taken_over", None))
+                and plugin.is_taken_over()
+                and callable(getattr(plugin, "retrieve_text", None))
+            )
+        except Exception:
+            return False
+
+    async def _kb_retrieve(self, query: str) -> str:
+        query = (query or "").strip()
+        if not query:
+            return ""
+        plugin = self._kb_plugin()
+        if not plugin:
+            if not self.kb_missing_warned:
+                self.kb_missing_warned = True
+                logger.warning("[OnCue] 决策要求查知识库，但未找到已启用的外部知识库插件，已忽略")
+            return ""
+        try:
+            taken_over = callable(getattr(plugin, "is_taken_over", None)) and plugin.is_taken_over()
+        except Exception:
+            taken_over = False
+        if not taken_over:
+            if not self.kb_not_taken_warned:
+                self.kb_not_taken_warned = True
+                logger.warning("[OnCue] 决策要求查知识库，但知识库插件未设为“被外部接管”，已忽略以避免重复注入")
+            return ""
+        try:
+            text = await plugin.retrieve_text(query)
+            if text:
+                logger.info(f"[OnCue] 知识库已检索: {len(text)} chars | {query[:60]}")
+            return text or ""
+        except Exception as e:
+            logger.error(f"[OnCue] 知识库检索失败，按无资料处理: {e}")
+            return ""
 
     async def _character_card(self, umo: str, platform_name: str = "") -> str:
         manual = self._cfg_str("character_card")
@@ -523,6 +578,8 @@ class OnCuePlugin(Star):
         }
         for key, value in mapping.items():
             template = template.replace(key, value)
+        if self._kb_available():
+            template += "\n\n知识库联动：如果这次开口需要外部资料才能答好，在同一个 JSON 里增加 \"need_kb\": true 和 \"kb_query\": \"独立检索词\"；否则省略或设为 false。kb_query 不要照抄群聊原话。"
         return template
 
     async def _glance_generate(self, chat: ChatFacts, umo: str, decision: dict) -> str:
@@ -534,6 +591,9 @@ class OnCuePlugin(Star):
             stage = "当前由角色本人回应。"
         if mood:
             stage += f"此刻的心情：{mood}。"
+        kb_text = str(decision.get("kb_text", "") or "").strip()
+        if kb_text:
+            stage += f"\n可参考知识库：\n{kb_text}"
         provider_id = await self.context.get_current_chat_provider_id(umo=umo)
         card = await self._character_card(umo, umo.split(":", 1)[0])
         prompt = GLANCE_GENERATE_PROMPT.replace("{character_card}", card or "（未填写角色卡）")
@@ -580,13 +640,20 @@ class OnCuePlugin(Star):
         should_reply = data.get("should_reply", False)
         if not isinstance(should_reply, bool):
             should_reply = str(should_reply).strip().lower() in {"true", "1", "yes", "y"}
+        need_kb = data.get("need_kb", False)
+        if not isinstance(need_kb, bool):
+            need_kb = str(need_kb).strip().lower() in {"true", "1", "yes", "y"}
         decision = {
             "should_reply": should_reply,
             "speaker": str(data.get("speaker", "") or "").strip(),
             "mood": str(data.get("mood", "") or "").strip(),
             "reason": str(data.get("reason", "") or "").strip(),
+            "need_kb": need_kb,
+            "kb_query": str(data.get("kb_query", "") or "").strip(),
             "_counted": False,
         }
+        if decision["need_kb"] and not decision["kb_query"]:
+            decision["need_kb"] = False
         if decision["should_reply"] and decision["reason"].lower() in {"", "无", "没有", "none", "null"}:
             decision["should_reply"] = False
             decision["reason"] = "正向理由为空，代码兜底不回复"
@@ -605,6 +672,8 @@ class OnCuePlugin(Star):
         prompt = await self._build_prompt(chat, entry_context, event.unified_msg_origin, event.get_platform_name())
         raw = await self._llm_decision(event.unified_msg_origin, prompt)
         decision = self._parse_decision(raw)
+        if decision["should_reply"] and decision.get("need_kb"):
+            decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
         if decision["should_reply"]:
             decision["_counted"] = True
             chat.reply_ts.append(now)
@@ -686,6 +755,9 @@ class OnCuePlugin(Star):
         if mood:
             line += f"此刻的心情：{mood}。"
         line += "以角色性格自然开口，不要提及本指令。"
+        kb_text = str(decision.get("kb_text", "") or "").strip()
+        if kb_text:
+            line += f"\n[知识库]\n{kb_text}\n结合角色性格自然使用，不要提及本指令。"
         req.system_prompt += "\n" + line
 
     @filter.after_message_sent()
