@@ -1,0 +1,218 @@
+{
+  "enable": {
+    "description": "启用决策层",
+    "type": "bool",
+    "default": true,
+    "hint": "此为必须项"
+  },
+  "config_wake": {
+    "description": "🔔 唤醒与观测",
+    "type": "object",
+    "items": {
+      "wake_names": {
+        "description": "唤醒昵称",
+        "type": "string",
+        "default": "",
+        "hint": "多个昵称用 | 分隔；留空则仅响应 @/引用/唤醒前缀"
+      },
+      "force_reply_when_summoned": {
+        "description": "被呼唤必须回应",
+        "type": "bool",
+        "default": true,
+        "hint": "关闭后，已被 AstrBot 唤醒但未被本插件放行的消息会被 veto"
+      },
+      "observation_timeout": {
+        "description": "观测窗口（秒）",
+        "type": "int",
+        "default": 120,
+        "hint": "Bot 实际发送回复后进入观测期的时长"
+      },
+      "observation_refresh": {
+        "description": "观测期随活动刷新",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后，观测期内有新活动会顺延观测窗；关闭则观测窗从上次回复固定计时"
+      }
+    }
+  },
+  "config_decision": {
+    "description": "🧠 决策层基础",
+    "type": "object",
+    "items": {
+      "analyzer_provider": {
+        "description": "决策模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "建议轻量快速模型；留空用当前对话模型"
+      },
+      "context_message_count": {
+        "description": "决策参考消息数",
+        "type": "int",
+        "default": 20
+      },
+      "reply_cooldown": {
+        "description": "回复后冷却（秒）",
+        "type": "int",
+        "default": 10
+      },
+      "no_reply_cooldown": {
+        "description": "决定不回后冷却（秒）",
+        "type": "int",
+        "default": 20
+      },
+      "max_replies_per_window": {
+        "description": "窗口内最多回复数",
+        "type": "int",
+        "default": 5
+      },
+      "reply_window_seconds": {
+        "description": "回复计数窗口（秒）",
+        "type": "int",
+        "default": 300,
+        "hint": "可预防消息风暴"
+      },
+      "decision_prompt": {
+        "description": "决策提示词（高级）",
+        "type": "text",
+        "default": "你是群聊角色扮演机器人的\"内心\"。请代入以下角色，判断看到群聊对话后是否想开口。\n\n<角色设定>\n{character_card}\n</角色设定>\n\n当前时间：{current_time}\n\n<触发背景>\n{entry_context}\n</触发背景>\n\n<群聊近况>\n{chat_history}\n</群聊近况>\n\n判断原则（按优先级）：\n1. 有人明确@或点名你、或直接向你提问 → 必须回应\n2. 话题命中角色的兴趣或专业领域、有人需要帮助、气氛需要打圆场 → 可以开口\n3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静\n4. 只有 [图片]/表情包且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静（[图片] 只代表群里有人活动，不是开口理由）\n5. 有任何犹豫 → 保持安静\n\n只输出 JSON，不要输出其它内容：\n{\"should_reply\": true或false, \"speaker\": \"回应的角色名(单角色填角色名)\", \"mood\": \"当前心情短语\", \"reason\": \"一句话理由\"}",
+        "hint": "可用变量: {character_card} {current_time} {entry_context} {chat_history}"
+      }
+    }
+  },
+  "config_condense": {
+    "description": "🤯 角色卡浓缩",
+    "type": "object",
+    "items": {
+      "decision_card_mode": {
+        "description": "角色卡处理",
+        "type": "string",
+        "default": "raw",
+        "options": ["raw", "condense"],
+        "labels": ["原始角色卡", "自动浓缩"],
+        "hint": "原始角色卡：直接使用角色卡；自动浓缩：把角色卡交给浓缩模型处理，并按“角色卡内容+浓缩提示词+最大字数”缓存"
+      },
+      "decision_card_condense_provider": {
+        "description": "角色卡浓缩模型",
+        "type": "string",
+        "default": "",
+        "_special": "select_provider",
+        "hint": "仅在 [角色卡处理] 选择“自动浓缩”时生效。留空则依次使用决策模型>当前对话模型。只在首次或者角色卡哈希值变更时触发浓缩"
+      },
+      "decision_card_condense_prompt": {
+        "description": "自动浓缩角色卡",
+        "type": "text",
+        "default": "把下面的角色设定浓缩成清晰表意且简洁的群聊专用“角色卡”，供轻量模型判断角色看到群聊对话后想不想开口。必须保留：身份/多灵魂分工（如有）、核心性格、话题亲和、爱好与雷区、作息、会开口的情况、应沉默的情况、多灵魂下由谁回应的规则、安全机制、特殊机制。删除：长背景、示例对话、主对话写作风格细则、格式要求、与是否开口无关的内容。输出纯文本，不超过{max_chars}字；不要 JSON；不要解释。\n\n<原始角色设定>\n{raw_card}\n</原始角色设定>",
+        "hint": "必须包含 {raw_card}；可用 {max_chars}。留空或缺少 {raw_card} 时自动浓缩不生效，直接使用原始角色卡"
+      },
+      "decision_card_max_chars": {
+        "description": "自动浓缩目标字数",
+        "type": "int",
+        "default": 1000,
+        "hint": "自动浓缩结果的最大字数，会自动把字数限制插入到“自动浓缩提示词”。"
+      }
+    }
+  },
+  "config_trigger": {
+    "description": "🕹️ 触发器",
+    "type": "object",
+    "items": {
+      "enable_echo_trigger": {
+        "description": "启用复读参与",
+        "type": "bool",
+        "default": false,
+        "hint": "群里如果多人复读同一句纯文本时给角色搭话机会。图片和表情包即使开启本选项也不参与"
+      },
+      "echo_threshold": {
+        "description": "复读判定次数",
+        "type": "int",
+        "default": 3
+      },
+      "echo_window": {
+        "description": "复读检测窗口（秒）",
+        "type": "int",
+        "default": 120
+      },
+      "enable_dense_trigger": {
+        "description": "启用密集发言参与",
+        "type": "bool",
+        "default": true,
+        "hint": "群里讨论热烈时给角色插话机会"
+      },
+      "dense_message_threshold": {
+        "description": "密集消息数阈值",
+        "type": "int",
+        "default": 10
+      },
+      "dense_participant_threshold": {
+        "description": "密集参与人数阈值",
+        "type": "int",
+        "default": 2
+      },
+      "dense_window": {
+        "description": "密集检测窗口（秒）",
+        "type": "int",
+        "default": 120
+      },
+      "trigger_backoff_max": {
+        "description": "触发退避倍率上限",
+        "type": "int",
+        "default": 4,
+        "hint": "同一触发源连续被拒则冷却翻倍，封顶倍率"
+      },
+      "enable_glance": {
+        "description": "启用定时一瞥 (GLANCE)",
+        "type": "bool",
+        "default": true,
+        "hint": "随机间隔瞄一眼群聊，由角色决定是否搭话；任务持久化到 AstrBot 的 data 目录"
+      },
+      "glance_min_minutes": {
+        "description": "一瞥最小间隔（分）",
+        "type": "int",
+        "default": 15
+      },
+      "glance_max_minutes": {
+        "description": "一瞥最大间隔（分）",
+        "type": "int",
+        "default": 35
+      }
+    }
+  },
+  "config_character": {
+    "description": "🎭 角色设定",
+    "type": "object",
+    "items": {
+      "persona_id": {
+        "description": "人格 ID",
+        "type": "string",
+        "default": "",
+        "_special": "select_persona",
+        "hint": "通过下方 [角色卡来源] 的选项启用或者弃用"
+      },
+      "persona_source": {
+        "description": "角色卡来源",
+        "type": "string",
+        "default": "persona_id",
+        "options": ["persona_id", "manual", "auto"],
+        "labels": [
+          "人格选择器（人格 ID）",
+          "手工角色卡（忽略人格 ID）",
+          "自动读取当前会话人格"
+        ],
+        "hint": "决策层所使用的角色卡的来源"
+      },
+      "character_card": {
+        "description": "手工角色卡",
+        "type": "text",
+        "default": "",
+        "hint": "可以填写性格特质、话题亲和度、在场节奏、多灵魂分工等的浓缩版，建议简洁一些"
+      },
+      "enable_speaker_routing": {
+        "description": "启用多灵魂分工",
+        "type": "bool",
+        "default": false,
+        "hint": "决策时将输出由谁回应并注入主提示词"
+      }
+    }
+  }
+}
