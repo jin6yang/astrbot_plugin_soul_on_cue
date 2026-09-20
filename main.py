@@ -84,7 +84,7 @@ class OnCuePlugin(Star):
         self.data_dir: Path | None = None
         self.glance_file: Path | None = None
         self.glance_next_due: dict[str, float] = {}
-        self.glance_last_check: dict[str, float] = {}
+        self.glance_last_check: dict[str, float] = {}  # 最近已完成决策的群聊活动时间
         self.glance_task: asyncio.Task | None = None
         self.persona_cache: dict[str, tuple[float, str]] = {}
         self.card_cache_file: Path | None = None
@@ -295,7 +295,6 @@ class OnCuePlugin(Star):
         async with chat.lock:
             now = time.time()
             last_check = self.glance_last_check.get(chat_id, 0.0)
-            self.glance_last_check[chat_id] = now
             cooldown_left = max(0.0, chat.cooldown_until - now)
             logger.info(f"[OnCue][GLANCE] 到期: {chat_id} | 冷却剩 {cooldown_left:.0f}s | 窗口回复 {len(chat.reply_ts)}")
             if chat.last_activity_ts <= last_check:
@@ -316,9 +315,13 @@ class OnCuePlugin(Star):
                 self._schedule_glance(chat_id, now)
                 return
             logger.info(f"[OnCue][GLANCE] 进入决策 | {chat_id}")
+            activity_ts = chat.last_activity_ts
             prompt = await self._build_prompt(chat, "你刚忙完自己的事，顺手瞄了一眼群聊。", chat_id, chat_id.split(":", 1)[0])
             raw = await self._llm_decision(chat_id, prompt)
             decision = self._parse_decision(raw)
+            # 跳过或决策失败时保留进度；明确决定沉默也算完成检查。
+            if decision["_valid"]:
+                self.glance_last_check[chat_id] = activity_ts
             if decision["should_reply"] and decision.get("need_kb"):
                 decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
             if not decision["should_reply"]:
@@ -663,13 +666,17 @@ class OnCuePlugin(Star):
                     data = parsed
             except Exception:
                 data = {}
-        should_reply = data.get("should_reply", False)
+        should_reply = data.get("should_reply")
+        valid = isinstance(should_reply, bool) or str(should_reply).strip().lower() in {
+            "true", "false", "1", "0", "yes", "no", "y", "n",
+        }
         if not isinstance(should_reply, bool):
             should_reply = str(should_reply).strip().lower() in {"true", "1", "yes", "y"}
         need_kb = data.get("need_kb", False)
         if not isinstance(need_kb, bool):
             need_kb = str(need_kb).strip().lower() in {"true", "1", "yes", "y"}
         decision = {
+            "_valid": valid,
             "should_reply": should_reply,
             "speaker": str(data.get("speaker", "") or "").strip(),
             "mood": str(data.get("mood", "") or "").strip(),
