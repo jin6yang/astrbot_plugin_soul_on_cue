@@ -8,13 +8,14 @@ from collections import deque
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
+from uuid import uuid4
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.core.message.components import At, Image, Plain
-from astrbot.core.message.message_event_result import MessageChain
+from astrbot.core.message.components import At, Image, Plain, Reply
+from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 
 
 DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请代入以下角色，判断看到群聊对话后是否想开口。
@@ -66,6 +67,7 @@ GLANCE_GENERATE_PROMPT = """你要以群聊角色的身份自然开口说一句�
 class ChatFacts:
     messages: deque = field(default_factory=lambda: deque(maxlen=50))
     reply_ts: deque = field(default_factory=deque)
+    pending_replies: dict[str, float] = field(default_factory=dict)
     backoffs: dict = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_reply_ts: float = 0.0
@@ -310,7 +312,7 @@ class OnCuePlugin(Star):
                 self._schedule_glance(chat_id, now, min_ts=until + 1)
                 return
             if not self._reply_window_allowed(chat, now):
-                logger.info(f"[OnCue][GLANCE] 跳过: 回复窗口已满 {len(chat.reply_ts)}/{self._cfg_int('max_replies_per_window', 5)} | {chat_id}")
+                logger.info(f"[OnCue][GLANCE] 跳过: 回复窗口已满 | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)} | {chat_id}")
                 self._schedule_glance(chat_id, now)
                 return
             logger.info(f"[OnCue][GLANCE] 进入决策 | {chat_id}")
@@ -343,9 +345,7 @@ class OnCuePlugin(Star):
                 logger.warning(f"[OnCue] GLANCE 未找到可用平台，发送失败: {chat_id}")
                 self._schedule_glance(chat_id, now)
                 return
-            chat.reply_ts.append(now)
-            chat.last_reply_ts = now
-            chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
+            self._record_reply(chat, text, now)
             self._trigger_success(chat, "glance")
             await self._append_assistant_history(chat_id, text)
             logger.info(f"[OnCue][GLANCE] 已主动开口: {text[:60]}")
@@ -517,6 +517,7 @@ class OnCuePlugin(Star):
             "time_str": datetime.now().strftime("%H:%M:%S"),
             "sender_id": str(event.get_sender_id()),
             "sender_name": str(sender_name),
+            "role": "user",
             "text": text or "[空消息]",
             "pure_text": pure_text,
             "active": bool(text or image_count or other_count),
@@ -546,10 +547,14 @@ class OnCuePlugin(Star):
         window = self._cfg_int("reply_window_seconds", 300)
         while chat.reply_ts and now - chat.reply_ts[0] > window:
             chat.reply_ts.popleft()
+        # 有些失败路径不会触发发送回调，待发送占位最多保留一个计数窗口。
+        for token, until in list(chat.pending_replies.items()):
+            if now >= until:
+                chat.pending_replies.pop(token, None)
 
     def _reply_window_allowed(self, chat: ChatFacts, now: float) -> bool:
         self._prune_reply_window(chat, now)
-        return len(chat.reply_ts) < self._cfg_int("max_replies_per_window", 5)
+        return len(chat.reply_ts) + len(chat.pending_replies) < self._cfg_int("max_replies_per_window", 5)
 
     def _trigger_ready(self, chat: ChatFacts, key: str, now: float) -> bool:
         state = chat.backoffs.get(key)
@@ -571,6 +576,22 @@ class OnCuePlugin(Star):
         count = max(1, self._cfg_int("context_message_count", 20))
         rows = list(chat.messages)[-count:]
         return "\n".join(f"[{m['sender_name']}/{m['time_str']}]: {m['text']}" for m in rows)
+
+    def _record_reply(self, chat: ChatFacts, text: str, now: float) -> None:
+        """在持有会话锁时记录发送结果；自身发言只供决策参考。"""
+        chat.messages.append({
+            "ts": now,
+            "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S"),
+            "sender_id": "assistant",
+            "sender_name": "Bot（你）",
+            "role": "assistant",
+            "text": text,
+            "pure_text": "",
+            "active": False,
+        })
+        chat.reply_ts.append(now)
+        chat.last_reply_ts = now
+        chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
 
     async def _build_prompt(self, chat: ChatFacts, entry_context: str, umo: str, platform_name: str = "") -> str:
         template = self._cfg_str("decision_prompt") or DEFAULT_DECISION_PROMPT
@@ -655,7 +676,6 @@ class OnCuePlugin(Star):
             "reason": str(data.get("reason", "") or "").strip(),
             "need_kb": need_kb,
             "kb_query": str(data.get("kb_query", "") or "").strip(),
-            "_counted": False,
         }
         if decision["need_kb"] and not decision["kb_query"]:
             decision["need_kb"] = False
@@ -673,7 +693,7 @@ class OnCuePlugin(Star):
         if not self._reply_window_allowed(chat, now):
             return False
         source = backoff_key or "observe"
-        logger.info(f"[OnCue] 决策调用: source={source} | 窗口回复 {len(chat.reply_ts)}/{self._cfg_int('max_replies_per_window', 5)}")
+        logger.info(f"[OnCue] 决策调用: source={source} | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
         prompt = await self._build_prompt(chat, entry_context, event.unified_msg_origin, event.get_platform_name())
         raw = await self._llm_decision(event.unified_msg_origin, prompt)
         decision = self._parse_decision(raw)
@@ -681,10 +701,11 @@ class OnCuePlugin(Star):
             decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
         now = time.time()
         if decision["should_reply"]:
-            decision["_counted"] = True
-            chat.reply_ts.append(now)
+            token = uuid4().hex
+            chat.pending_replies[token] = now + max(1, self._cfg_int("reply_window_seconds", 300))
+            decision["_reservation"] = token
+            decision["_backoff_key"] = backoff_key
             chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
-            self._trigger_success(chat, backoff_key)
             event.set_extra("oncue_decision", decision)
             event.is_at_or_wake_command = True
             logger.info(f"[OnCue] 决定回复: source={source} | {decision['reason']}")
@@ -701,7 +722,7 @@ class OnCuePlugin(Star):
             threshold = self._cfg_int("echo_threshold", 3)
             norm = re.sub(r"\s+", " ", item["pure_text"]).strip()
             if norm:
-                count = sum(1 for m in chat.messages if now - m["ts"] <= window and re.sub(r"\s+", " ", m["pure_text"]).strip() == norm)
+                count = sum(1 for m in chat.messages if m.get("role", "user") == "user" and now - m["ts"] <= window and re.sub(r"\s+", " ", m["pure_text"]).strip() == norm)
                 key = f"echo:{norm}"
                 if count >= threshold and self._trigger_ready(chat, key, now):
                     logger.info(f"[OnCue] 触发边命中: echo | {count}/{threshold} | {norm[:40]}")
@@ -709,7 +730,7 @@ class OnCuePlugin(Star):
                     return
         if self._cfg_bool("enable_dense_trigger", False):
             window = self._cfg_int("dense_window", 120)
-            recent = [m for m in chat.messages if now - m["ts"] <= window and m["active"]]
+            recent = [m for m in chat.messages if m.get("role", "user") == "user" and now - m["ts"] <= window and m["active"]]
             participants = {m["sender_id"] for m in recent}
             if len(recent) >= self._cfg_int("dense_message_threshold", 10) and len(participants) >= self._cfg_int("dense_participant_threshold", 3):
                 key = "dense"
@@ -737,7 +758,7 @@ class OnCuePlugin(Star):
             self._ensure_glance_schedule(event.unified_msg_origin, now)
             if self._is_forced(event, item):
                 if self._cfg_bool("force_reply_when_summoned", True):
-                    event.set_extra("oncue_decision", {"should_reply": True, "speaker": "", "mood": "", "reason": "被@/点名强制唤醒", "_counted": False})
+                    event.set_extra("oncue_decision", {"should_reply": True, "speaker": "", "mood": "", "reason": "被@/点名强制唤醒"})
                     event.is_at_or_wake_command = True
                     logger.info(f"[OnCue] 强制唤醒: {item['sender_name']} | {item['pure_text'][:60]}")
                 elif event.is_at_or_wake_command:
@@ -770,6 +791,13 @@ class OnCuePlugin(Star):
             line += f"\n[知识库]\n{kb_text}\n结合角色性格自然使用，不要提及本指令。"
         req.system_prompt += "\n" + line
 
+    @filter.on_decorating_result()
+    async def mark_streaming_reply_sent(self, event: AstrMessageEvent):
+        # AstrBot 的流式发送路径可能不触发 after_message_sent。
+        result = event.get_result()
+        if result and result.result_content_type == ResultContentType.STREAMING_FINISH:
+            await self.mark_reply_sent(event)
+
     @filter.after_message_sent()
     async def mark_reply_sent(self, event: AstrMessageEvent):
         decision = event.get_extra("oncue_decision")
@@ -777,10 +805,29 @@ class OnCuePlugin(Star):
             return
         chat = self._chat(event.unified_msg_origin)
         async with chat.lock:
+            # 同一事件可能经过多个完成入口，取锁后再次检查，避免重复入账。
+            decision = event.get_extra("oncue_decision")
+            if not isinstance(decision, dict) or not decision.get("should_reply"):
+                return
+            chat.pending_replies.pop(decision.get("_reservation"), None)
+            event.set_extra("oncue_decision", None)
+            result = event.get_result()
+            # 非空结果只是待发送内容，不能单独作为成功发送的依据。
+            if not getattr(event, "_has_send_oper", False) or not result:
+                return
+            parts = []
+            for comp in result.chain or []:
+                if isinstance(comp, Plain):
+                    if (comp.text or "").strip():
+                        parts.append(comp.text.strip())
+                elif isinstance(comp, Image):
+                    parts.append("[图片]")
+                elif not isinstance(comp, (At, Reply)):
+                    parts.append("[附件]")
+            text = " ".join(parts)
+            if not text:
+                return
             now = time.time()
-            if not decision.get("_counted"):
-                chat.reply_ts.append(now)
-            chat.last_reply_ts = now
-            chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
+            self._record_reply(chat, text, now)
+            self._trigger_success(chat, decision.get("_backoff_key"))
             logger.info(f"[OnCue] 回复已发送: 进入观测 {self._cfg_int('observation_timeout', 120)}s | 冷却 {self._cfg_int('reply_cooldown', 10)}s")
-        event.set_extra("oncue_decision", None)
