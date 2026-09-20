@@ -6,6 +6,7 @@ import json
 import logging
 import sys
 import unittest
+from enum import Enum, auto
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -21,9 +22,16 @@ class Star:
         self.context = context
 
 
+class ResultContentType(Enum):
+    GENERAL_RESULT = auto()
+    LLM_RESULT = auto()
+    STREAMING_RESULT = auto()
+    STREAMING_FINISH = auto()
+
+
 def _event(text="hello", *, summoned=False):
     extras = {}
-    return SimpleNamespace(
+    event = SimpleNamespace(
         unified_msg_origin="test:GroupMessage:1",
         is_at_or_wake_command=summoned,
         message_obj=SimpleNamespace(sender=SimpleNamespace(nickname="Alice")),
@@ -33,7 +41,11 @@ def _event(text="hello", *, summoned=False):
         get_messages=lambda: [Plain(text)] if text else [],
         get_extra=extras.get,
         set_extra=extras.__setitem__,
+        _has_send_oper=False,
+        result=SimpleNamespace(chain=[], result_content_type=ResultContentType.LLM_RESULT),
     )
+    event.get_result = lambda: event.result
+    return event
 
 
 def _load_plugin():
@@ -49,6 +61,7 @@ def _load_plugin():
                 EventMessageType=SimpleNamespace(GROUP_MESSAGE=1),
                 event_message_type=decorator,
                 on_llm_request=decorator,
+                on_decorating_result=decorator,
                 after_message_sent=decorator,
             ),
         },
@@ -60,8 +73,9 @@ def _load_plugin():
             "Plain": Plain,
             "Image": type("Image", (), {}),
             "At": type("At", (), {}),
+            "Reply": type("Reply", (), {}),
         },
-        "astrbot.core.message.message_event_result": {"MessageChain": list},
+        "astrbot.core.message.message_event_result": {"MessageChain": list, "ResultContentType": ResultContentType},
     }
     modules = {}
     for name, attributes in api.items():
@@ -150,6 +164,8 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(event.get_extra("oncue_decision")["should_reply"])
         self.assertFalse(self.plugin._is_observing(self.chat, self.now))
         self.now = 1030.0
+        event._has_send_oper = True
+        event.result.chain = [Plain("reply")]
         await self.plugin.mark_reply_sent(event)
         self.assertTrue(self.plugin._is_observing(self.chat, 1149.0))
         self.assertFalse(self.plugin._is_observing(self.chat, 1150.0))
@@ -179,7 +195,8 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._kb_retrieve = AsyncMock(side_effect=retrieve)
         self.assertTrue(await self.plugin._decide_locked(self.event, self.chat, "observe", None))
         self.assertEqual(self.chat.cooldown_until, 1055.0)
-        self.assertEqual(list(self.chat.reply_ts), [1045.0])
+        self.assertEqual(list(self.chat.reply_ts), [])
+        self.assertEqual(len(self.chat.pending_replies), 1)
         self.now = 1054.0
         self.assertFalse(await self.plugin._decide_locked(_event(), self.chat, "observe", None))
         self.plugin._llm_decision.assert_awaited_once()
@@ -261,7 +278,9 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._llm_decision.assert_awaited_once()
 
     async def test_reply_callback_starts_cooldown_after_waiting_for_chat_lock(self):
-        self.event.set_extra("oncue_decision", {"should_reply": True, "_counted": False})
+        self.event.set_extra("oncue_decision", {"should_reply": True})
+        self.event._has_send_oper = True
+        self.event.result.chain = [Plain("reply")]
         async with self.chat.lock:
             pending = asyncio.create_task(self.plugin.mark_reply_sent(self.event))
             await asyncio.sleep(0)
