@@ -70,6 +70,7 @@ class ChatFacts:
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     last_reply_ts: float = 0.0
     last_activity_ts: float = 0.0
+    last_observation_activity_ts: float = 0.0
     cooldown_until: float = 0.0
 
 
@@ -282,14 +283,15 @@ class OnCuePlugin(Star):
             due_chats = [chat_id for chat_id, ts in self.glance_next_due.items() if ts <= now]
             for chat_id in due_chats:
                 try:
-                    await self._glance_due(chat_id, now)
+                    await self._glance_due(chat_id)
                 except Exception as e:
                     logger.error(f"[OnCue] GLANCE 执行失败 {chat_id}: {e}")
-                    self._schedule_glance(chat_id, now)
+                    self._schedule_glance(chat_id, time.time())
 
-    async def _glance_due(self, chat_id: str, now: float) -> None:
+    async def _glance_due(self, chat_id: str) -> None:
         chat = self._chat(chat_id)
         async with chat.lock:
+            now = time.time()
             last_check = self.glance_last_check.get(chat_id, 0.0)
             self.glance_last_check[chat_id] = now
             cooldown_left = max(0.0, chat.cooldown_until - now)
@@ -318,6 +320,7 @@ class OnCuePlugin(Star):
             if decision["should_reply"] and decision.get("need_kb"):
                 decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
             if not decision["should_reply"]:
+                now = time.time()
                 mult = self._trigger_reject(chat, "glance", now)
                 cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
                 chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
@@ -327,6 +330,7 @@ class OnCuePlugin(Star):
             text = await self._glance_generate(chat, chat_id, decision)
             text = text.strip()
             if not text:
+                now = time.time()
                 mult = self._trigger_reject(chat, "glance", now)
                 cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
                 chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
@@ -334,6 +338,7 @@ class OnCuePlugin(Star):
                 self._schedule_glance(chat_id, now)
                 return
             ok = await self.context.send_message(chat_id, MessageChain([Plain(text)]))
+            now = time.time()
             if not ok:
                 logger.warning(f"[OnCue] GLANCE 未找到可用平台，发送失败: {chat_id}")
                 self._schedule_glance(chat_id, now)
@@ -534,7 +539,7 @@ class OnCuePlugin(Star):
             return False
         base = chat.last_reply_ts
         if self._cfg_bool("observation_refresh", True):
-            base = max(chat.last_reply_ts, chat.last_activity_ts)
+            base = max(chat.last_reply_ts, chat.last_observation_activity_ts)
         return now - base < timeout
 
     def _prune_reply_window(self, chat: ChatFacts, now: float) -> None:
@@ -674,6 +679,7 @@ class OnCuePlugin(Star):
         decision = self._parse_decision(raw)
         if decision["should_reply"] and decision.get("need_kb"):
             decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
+        now = time.time()
         if decision["should_reply"]:
             decision["_counted"] = True
             chat.reply_ts.append(now)
@@ -718,12 +724,16 @@ class OnCuePlugin(Star):
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
         chat = self._chat(event.unified_msg_origin)
-        now = time.time()
         async with chat.lock:
+            now = time.time()
+            observing = self._is_observing(chat, now)
             item = self._event_to_item(event)
             chat.messages.append(item)
             if item["active"]:
                 chat.last_activity_ts = now
+                # 静默期活动只更新群聊活跃度，不能重新开启已经过期的观测窗。
+                if observing and self._cfg_bool("observation_refresh", True):
+                    chat.last_observation_activity_ts = now
             self._ensure_glance_schedule(event.unified_msg_origin, now)
             if self._is_forced(event, item):
                 if self._cfg_bool("force_reply_when_summoned", True):
@@ -734,7 +744,7 @@ class OnCuePlugin(Star):
                     event.stop_event()
                     logger.warning(f"[OnCue] 已 veto 被唤醒事件: {item['sender_name']} | {item['pure_text'][:60]}")
                 return
-            if self._is_observing(chat, now):
+            if observing:
                 await self._decide_locked(event, chat, "你刚才已经开口过，现在还在观测窗内；判断这一幕是否值得再接话。", None)
             else:
                 await self._maybe_stat_trigger_locked(event, chat, item, now)
@@ -766,8 +776,8 @@ class OnCuePlugin(Star):
         if not isinstance(decision, dict) or not decision.get("should_reply"):
             return
         chat = self._chat(event.unified_msg_origin)
-        now = time.time()
         async with chat.lock:
+            now = time.time()
             if not decision.get("_counted"):
                 chat.reply_ts.append(now)
             chat.last_reply_ts = now
