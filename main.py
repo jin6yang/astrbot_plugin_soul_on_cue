@@ -70,6 +70,8 @@ class ChatFacts:
     pending_replies: dict[str, float] = field(default_factory=dict)
     backoffs: dict = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    decision_inflight: bool = False
+    reply_version: int = 0  # 点名或新回复会使在途的主动决策失效
     last_reply_ts: float = 0.0
     last_activity_ts: float = 0.0
     last_observation_activity_ts: float = 0.0
@@ -294,6 +296,10 @@ class OnCuePlugin(Star):
         chat = self._chat(chat_id)
         async with chat.lock:
             now = time.time()
+            if chat.decision_inflight:
+                logger.info(f"[OnCue][GLANCE] 跳过: 同会话决策中 | {chat_id}")
+                self._schedule_glance(chat_id, now)
+                return
             last_check = self.glance_last_check.get(chat_id, 0.0)
             cooldown_left = max(0.0, chat.cooldown_until - now)
             logger.info(f"[OnCue][GLANCE] 到期: {chat_id} | 冷却剩 {cooldown_left:.0f}s | 窗口回复 {len(chat.reply_ts)}")
@@ -316,43 +322,62 @@ class OnCuePlugin(Star):
                 return
             logger.info(f"[OnCue][GLANCE] 进入决策 | {chat_id}")
             activity_ts = chat.last_activity_ts
-            prompt = await self._build_prompt(chat, "你刚忙完自己的事，顺手瞄了一眼群聊。", chat_id, chat_id.split(":", 1)[0])
+            chat_history = self._history_text(chat)
+            reply_version = chat.reply_version
+            chat.decision_inflight = True
+        try:
+            prompt = await self._build_prompt(chat_history, "你刚忙完自己的事，顺手瞄了一眼群聊。", chat_id, chat_id.split(":", 1)[0])
             raw = await self._llm_decision(chat_id, prompt)
             decision = self._parse_decision(raw)
-            # 跳过或决策失败时保留进度；明确决定沉默也算完成检查。
-            if decision["_valid"]:
-                self.glance_last_check[chat_id] = activity_ts
+            async with chat.lock:
+                now = time.time()
+                if not self._decision_current(chat, reply_version, now):
+                    logger.info(f"[OnCue][GLANCE] 会话状态已变化，忽略本次决策 | {chat_id}")
+                    self._schedule_glance(chat_id, now)
+                    return
+                # 只推进快照中的活动，模型调用期间的新消息留待下次检查。
+                if decision["_valid"]:
+                    self.glance_last_check[chat_id] = activity_ts
+                if not decision["should_reply"]:
+                    mult = self._trigger_reject(chat, "glance", now)
+                    cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
+                    chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
+                    logger.info(f"[OnCue][GLANCE] 决定沉默: {decision['reason']} | 退避 x{mult} 冷却 {cooldown}s")
+                    self._schedule_glance(chat_id, now)
+                    return
             if decision["should_reply"] and decision.get("need_kb"):
                 decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
-            if not decision["should_reply"]:
-                now = time.time()
-                mult = self._trigger_reject(chat, "glance", now)
-                cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
-                chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
-                logger.info(f"[OnCue][GLANCE] 决定沉默: {decision['reason']} | 退避 x{mult} 冷却 {cooldown}s")
-                self._schedule_glance(chat_id, now)
-                return
-            text = await self._glance_generate(chat, chat_id, decision)
+            text = await self._glance_generate(chat_history, chat_id, decision)
             text = text.strip()
-            if not text:
+            async with chat.lock:
                 now = time.time()
-                mult = self._trigger_reject(chat, "glance", now)
-                cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
-                chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
-                logger.info(f"[OnCue][GLANCE] 决定回复但生成为空 | 退避 x{mult} 冷却 {cooldown}s")
-                self._schedule_glance(chat_id, now)
-                return
+                if not self._decision_current(chat, reply_version, now):
+                    logger.info(f"[OnCue][GLANCE] 会话状态已变化，取消本次主动发送 | {chat_id}")
+                    self._schedule_glance(chat_id, now)
+                    return
+                if not text:
+                    mult = self._trigger_reject(chat, "glance", now)
+                    cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
+                    chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
+                    logger.info(f"[OnCue][GLANCE] 决定回复但生成为空 | 退避 x{mult} 冷却 {cooldown}s")
+                    self._schedule_glance(chat_id, now)
+                    return
             ok = await self.context.send_message(chat_id, MessageChain([Plain(text)]))
-            now = time.time()
-            if not ok:
-                logger.warning(f"[OnCue] GLANCE 未找到可用平台，发送失败: {chat_id}")
+            async with chat.lock:
+                now = time.time()
+                if not ok:
+                    logger.warning(f"[OnCue] GLANCE 未找到可用平台，发送失败: {chat_id}")
+                    self._schedule_glance(chat_id, now)
+                    return
+                # 已开始的发送以返回结果为准，不能因期间的新点名而丢掉发送记录。
+                self._record_reply(chat, text, now)
+                self._trigger_success(chat, "glance")
                 self._schedule_glance(chat_id, now)
-                return
-            self._record_reply(chat, text, now)
-            self._trigger_success(chat, "glance")
             await self._append_assistant_history(chat_id, text)
             logger.info(f"[OnCue][GLANCE] 已主动开口: {text[:60]}")
-            self._schedule_glance(chat_id, now)
+        finally:
+            async with chat.lock:
+                chat.decision_inflight = False
 
     async def _append_assistant_history(self, umo: str, text: str) -> None:
         try:
@@ -559,6 +584,15 @@ class OnCuePlugin(Star):
         self._prune_reply_window(chat, now)
         return len(chat.reply_ts) + len(chat.pending_replies) < self._cfg_int("max_replies_per_window", 5)
 
+    def _decision_current(self, chat: ChatFacts, reply_version: int, now: float) -> bool:
+        """持有会话锁时复核，避免应用网络调用期间已过时的决策。"""
+        return (
+            self._cfg_bool("enable", True)
+            and chat.reply_version == reply_version
+            and now >= chat.cooldown_until
+            and self._reply_window_allowed(chat, now)
+        )
+
     def _trigger_ready(self, chat: ChatFacts, key: str, now: float) -> bool:
         state = chat.backoffs.get(key)
         return not state or now >= float(state.get("until", 0.0))
@@ -593,16 +627,17 @@ class OnCuePlugin(Star):
             "active": False,
         })
         chat.reply_ts.append(now)
+        chat.reply_version += 1
         chat.last_reply_ts = now
         chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
 
-    async def _build_prompt(self, chat: ChatFacts, entry_context: str, umo: str, platform_name: str = "") -> str:
+    async def _build_prompt(self, chat_history: str, entry_context: str, umo: str, platform_name: str = "") -> str:
         template = self._cfg_str("decision_prompt") or DEFAULT_DECISION_PROMPT
         card = await self._decision_card(umo, platform_name) or "（未填写角色卡；按谨慎、不插话处理）"
         mapping = {
             "{character_card}": card,
             "{current_time}": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "{chat_history}": self._history_text(chat) or "（暂无）",
+            "{chat_history}": chat_history or "（暂无）",
             "{entry_context}": entry_context,
         }
         for key, value in mapping.items():
@@ -611,7 +646,7 @@ class OnCuePlugin(Star):
             template += "\n\n知识库联动：如果这次开口需要外部资料才能答好，在同一个 JSON 里增加 \"need_kb\": true 和 \"kb_query\": \"独立检索词\"；否则省略或设为 false。kb_query 不要照抄群聊原话。"
         return template
 
-    async def _glance_generate(self, chat: ChatFacts, umo: str, decision: dict) -> str:
+    async def _glance_generate(self, chat_history: str, umo: str, decision: dict) -> str:
         speaker = decision.get("speaker", "").strip()
         mood = decision.get("mood", "").strip()
         if self._cfg_bool("enable_speaker_routing", False) and speaker:
@@ -628,7 +663,7 @@ class OnCuePlugin(Star):
         prompt = GLANCE_GENERATE_PROMPT.replace("{character_card}", card or "（未填写角色卡）")
         prompt = prompt.replace("{current_time}", datetime.now().strftime("%Y-%m-%d %H:%M:%S"))
         prompt = prompt.replace("{stage_direction}", stage)
-        prompt = prompt.replace("{chat_history}", self._history_text(chat) or "（暂无）")
+        prompt = prompt.replace("{chat_history}", chat_history or "（暂无）")
         try:
             resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
             return resp.completion_text or ""
@@ -691,39 +726,51 @@ class OnCuePlugin(Star):
             decision["reason"] = "正向理由为空，代码兜底不回复"
         return decision
 
-    async def _decide_locked(self, event: AstrMessageEvent, chat: ChatFacts, entry_context: str, backoff_key: str | None) -> bool:
-        now = time.time()
-        if now < chat.cooldown_until:
-            return False
-        if backoff_key and not self._trigger_ready(chat, backoff_key, now):
-            return False
-        if not self._reply_window_allowed(chat, now):
-            return False
-        source = backoff_key or "observe"
-        logger.info(f"[OnCue] 决策调用: source={source} | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
-        prompt = await self._build_prompt(chat, entry_context, event.unified_msg_origin, event.get_platform_name())
-        raw = await self._llm_decision(event.unified_msg_origin, prompt)
-        decision = self._parse_decision(raw)
-        if decision["should_reply"] and decision.get("need_kb"):
-            decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
-        now = time.time()
-        if decision["should_reply"]:
-            token = uuid4().hex
-            chat.pending_replies[token] = now + max(1, self._cfg_int("reply_window_seconds", 300))
-            decision["_reservation"] = token
-            decision["_backoff_key"] = backoff_key
-            chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
-            event.set_extra("oncue_decision", decision)
-            event.is_at_or_wake_command = True
-            logger.info(f"[OnCue] 决定回复: source={source} | {decision['reason']}")
-            return True
-        mult = self._trigger_reject(chat, backoff_key, now) if backoff_key else 1
-        cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
-        chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
-        logger.info(f"[OnCue] 决定沉默: source={source} | 冷却 {cooldown}s | {decision['reason'] or raw[:80]}")
-        return False
+    async def _decide(self, event: AstrMessageEvent, chat: ChatFacts, entry_context: str, backoff_key: str | None) -> bool:
+        async with chat.lock:
+            now = time.time()
+            if chat.decision_inflight or now < chat.cooldown_until:
+                return False
+            if backoff_key and not self._trigger_ready(chat, backoff_key, now):
+                return False
+            if not self._reply_window_allowed(chat, now):
+                return False
+            source = backoff_key or "observe"
+            logger.info(f"[OnCue] 决策调用: source={source} | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
+            chat_history = self._history_text(chat)
+            reply_version = chat.reply_version
+            chat.decision_inflight = True
+        try:
+            prompt = await self._build_prompt(chat_history, entry_context, event.unified_msg_origin, event.get_platform_name())
+            raw = await self._llm_decision(event.unified_msg_origin, prompt)
+            decision = self._parse_decision(raw)
+            if decision["should_reply"] and decision.get("need_kb"):
+                decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
+            async with chat.lock:
+                now = time.time()
+                if not self._decision_current(chat, reply_version, now):
+                    logger.info(f"[OnCue] 会话状态已变化，忽略本次决策: source={source}")
+                    return False
+                if decision["should_reply"]:
+                    token = uuid4().hex
+                    chat.pending_replies[token] = now + max(1, self._cfg_int("reply_window_seconds", 300))
+                    decision["_reservation"] = token
+                    decision["_backoff_key"] = backoff_key
+                    chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
+                    event.set_extra("oncue_decision", decision)
+                    event.is_at_or_wake_command = True
+                    logger.info(f"[OnCue] 决定回复: source={source} | {decision['reason']}")
+                    return True
+                mult = self._trigger_reject(chat, backoff_key, now) if backoff_key else 1
+                cooldown = self._cfg_int("no_reply_cooldown", 20) * mult
+                chat.cooldown_until = max(chat.cooldown_until, now + cooldown)
+                logger.info(f"[OnCue] 决定沉默: source={source} | 冷却 {cooldown}s | {decision['reason'] or raw[:80]}")
+                return False
+        finally:
+            async with chat.lock:
+                chat.decision_inflight = False
 
-    async def _maybe_stat_trigger_locked(self, event: AstrMessageEvent, chat: ChatFacts, item: dict, now: float) -> None:
+    def _stat_trigger_locked(self, chat: ChatFacts, item: dict, now: float) -> tuple[str, str] | None:
         if self._cfg_bool("enable_echo_trigger", False) and item["pure_text"] and item["text"] == item["pure_text"]:
             window = self._cfg_int("echo_window", 120)
             threshold = self._cfg_int("echo_threshold", 3)
@@ -733,8 +780,7 @@ class OnCuePlugin(Star):
                 key = f"echo:{norm}"
                 if count >= threshold and self._trigger_ready(chat, key, now):
                     logger.info(f"[OnCue] 触发边命中: echo | {count}/{threshold} | {norm[:40]}")
-                    await self._decide_locked(event, chat, "群里多人在复读同一句话。", key)
-                    return
+                    return "群里多人在复读同一句话。", key
         if self._cfg_bool("enable_dense_trigger", False):
             window = self._cfg_int("dense_window", 120)
             recent = [m for m in chat.messages if m.get("role", "user") == "user" and now - m["ts"] <= window and m["active"]]
@@ -743,7 +789,8 @@ class OnCuePlugin(Star):
                 key = "dense"
                 if self._trigger_ready(chat, key, now):
                     logger.info(f"[OnCue] 触发边命中: dense | 消息 {len(recent)}/{self._cfg_int('dense_message_threshold', 10)} | 人数 {len(participants)}/{self._cfg_int('dense_participant_threshold', 3)}")
-                    await self._decide_locked(event, chat, "群里讨论突然变得热烈。", key)
+                    return "群里讨论突然变得热烈。", key
+        return None
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-10)
     async def on_message(self, event: AstrMessageEvent):
@@ -765,6 +812,7 @@ class OnCuePlugin(Star):
             self._ensure_glance_schedule(event.unified_msg_origin, now)
             if self._is_forced(event, item):
                 if self._cfg_bool("force_reply_when_summoned", True):
+                    chat.reply_version += 1
                     event.set_extra("oncue_decision", {"should_reply": True, "speaker": "", "mood": "", "reason": "被@/点名强制唤醒"})
                     event.is_at_or_wake_command = True
                     logger.info(f"[OnCue] 强制唤醒: {item['sender_name']} | {item['pure_text'][:60]}")
@@ -773,9 +821,11 @@ class OnCuePlugin(Star):
                     logger.warning(f"[OnCue] 已 veto 被唤醒事件: {item['sender_name']} | {item['pure_text'][:60]}")
                 return
             if observing:
-                await self._decide_locked(event, chat, "你刚才已经开口过，现在还在观测窗内；判断这一幕是否值得再接话。", None)
+                trigger = ("你刚才已经开口过，现在还在观测窗内；判断这一幕是否值得再接话。", None)
             else:
-                await self._maybe_stat_trigger_locked(event, chat, item, now)
+                trigger = self._stat_trigger_locked(chat, item, now)
+        if trigger:
+            await self._decide(event, chat, *trigger)
 
     @filter.on_llm_request()
     async def inject_stage_direction(self, event: AstrMessageEvent, req: ProviderRequest):
