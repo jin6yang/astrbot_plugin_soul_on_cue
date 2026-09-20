@@ -28,7 +28,7 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._glance_interval_seconds = lambda: 900.0
 
     async def decide(self):
-        return await self.plugin._decide_locked(self.event, self.chat, "observe", None)
+        return await self.plugin._decide(self.event, self.chat, "observe", None)
 
     def sent_result(self, text="bot reply"):
         self.event._has_send_oper = True
@@ -92,10 +92,10 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config["max_replies_per_window"] = 1
         self.assertTrue(await self.decide())
         self.now = 1020.0
-        self.assertFalse(await self.plugin._decide_locked(_event(), self.chat, "observe", None))
+        self.assertFalse(await self.plugin._decide(_event(), self.chat, "observe", None))
         self.plugin._llm_decision.assert_awaited_once()
         await self.plugin.mark_reply_sent(self.event)
-        self.assertTrue(await self.plugin._decide_locked(_event(), self.chat, "observe", None))
+        self.assertTrue(await self.plugin._decide(_event(), self.chat, "observe", None))
         self.assertEqual(list(self.chat.reply_ts), [])
         self.assertEqual(len(self.chat.pending_replies), 1)
 
@@ -187,13 +187,11 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         event = _event("same text")
         item = self.plugin._event_to_item(event)
         self.chat.messages.append(item)
-        self.plugin._decide_locked = AsyncMock(return_value=False)
-        await self.plugin._maybe_stat_trigger_locked(event, self.chat, item, self.now)
-        self.plugin._decide_locked.assert_not_awaited()
+        self.assertIsNone(self.plugin._stat_trigger_locked(self.chat, item, self.now))
 
     async def test_trigger_backoff_resets_only_after_a_sent_reply(self):
         self.chat.backoffs["dense"] = {"count": 2, "until": 0.0}
-        self.assertTrue(await self.plugin._decide_locked(self.event, self.chat, "dense", "dense"))
+        self.assertTrue(await self.plugin._decide(self.event, self.chat, "dense", "dense"))
         self.assertIn("dense", self.chat.backoffs)
         self.sent_result()
         await self.plugin.mark_reply_sent(self.event)

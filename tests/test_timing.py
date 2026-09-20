@@ -193,15 +193,15 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin._llm_decision.side_effect = decide
         self.plugin._kb_retrieve = AsyncMock(side_effect=retrieve)
-        self.assertTrue(await self.plugin._decide_locked(self.event, self.chat, "observe", None))
+        self.assertTrue(await self.plugin._decide(self.event, self.chat, "observe", None))
         self.assertEqual(self.chat.cooldown_until, 1055.0)
         self.assertEqual(list(self.chat.reply_ts), [])
         self.assertEqual(len(self.chat.pending_replies), 1)
         self.now = 1054.0
-        self.assertFalse(await self.plugin._decide_locked(_event(), self.chat, "observe", None))
+        self.assertFalse(await self.plugin._decide(_event(), self.chat, "observe", None))
         self.plugin._llm_decision.assert_awaited_once()
         self.now = 1055.0
-        self.assertTrue(await self.plugin._decide_locked(_event(), self.chat, "observe", None))
+        self.assertTrue(await self.plugin._decide(_event(), self.chat, "observe", None))
         self.assertEqual(self.plugin._llm_decision.await_count, 2)
 
     async def test_slow_negative_decision_starts_cooldown_and_backoff_on_completion(self):
@@ -210,7 +210,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
             return '{"should_reply": false}'
 
         self.plugin._llm_decision.side_effect = decide
-        self.assertFalse(await self.plugin._decide_locked(self.event, self.chat, "dense", "dense"))
+        self.assertFalse(await self.plugin._decide(self.event, self.chat, "dense", "dense"))
         self.assertEqual(self.chat.cooldown_until, 1070.0)
         self.assertFalse(self.plugin._trigger_ready(self.chat, "dense", 1069.0))
         self.assertTrue(self.plugin._trigger_ready(self.chat, "dense", 1070.0))
