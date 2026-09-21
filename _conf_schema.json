@@ -120,8 +120,8 @@
       "enable_echo_trigger": {
         "description": "启用复读参与",
         "type": "bool",
-        "default": false,
-        "hint": "群里如果多人复读同一句纯文本时给角色搭话机会。图片和表情包即使开启本选项也不参与"
+        "default": true,
+        "hint": "当群里多人复读同一句纯文本时，给角色搭话的机会。注意，图片和表情包无效。（不会强制参与，仅显式给予机会）"
       },
       "echo_threshold": {
         "description": "复读判定次数",
@@ -137,7 +137,7 @@
         "description": "启用密集发言参与",
         "type": "bool",
         "default": true,
-        "hint": "群里讨论热烈时给角色插话机会"
+        "hint": "当群里讨论热烈时，给角色搭话的机会。（不会强制参与，仅显式给予机会）"
       },
       "dense_message_threshold": {
         "description": "密集消息数阈值",
