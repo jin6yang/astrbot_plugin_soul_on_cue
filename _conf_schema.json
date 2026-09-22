@@ -147,14 +147,15 @@
         "default": 10
       },
       "dense_participant_threshold": {
-        "description": "密集参与人数阈值",
+        "description": "触发密集参与的人数阈值",
         "type": "int",
         "default": 2
       },
       "dense_window": {
-        "description": "密集检测窗口（秒）",
+        "description": "密集发言检测的窗口时间（秒）",
         "type": "int",
-        "default": 120
+        "default": 180,
+        "hint": "超时则视为脱离密集发言的状态"
       },
       "trigger_backoff_max": {
         "description": "触发退避倍率上限",
