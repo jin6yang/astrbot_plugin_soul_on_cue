@@ -121,17 +121,19 @@
         "description": "启用复读参与",
         "type": "bool",
         "default": true,
-        "hint": "当群里多人复读同一句纯文本时，给角色搭话的机会。注意，图片和表情包无效。（不会强制参与，仅显式给予机会）"
+        "hint": "当群里多人复读同一句纯文本时,给角色搭话的机会。注意,单独或混有图片合表情包的消息无效。（不会强制参与，仅显式给予机会）"
       },
       "echo_threshold": {
-        "description": "复读判定次数",
+        "description": "触发复读参与的人数阈值",
         "type": "int",
-        "default": 3
+        "default": 3,
+        "hint": "配置触发复读状态的多则消息至少来自多少名不同的成员。同一成员反复发送只计 1 人，最少 2 人，最多为 [检测最近消息的数量]"
       },
-      "echo_window": {
-        "description": "复读检测窗口（秒）",
+      "echo_message_count": {
+        "description": "检测最近消息的数量",
         "type": "int",
-        "default": 120
+        "default": 5,
+        "hint": "检测最近多少条缓存消息中是否包含复读的情况当前消息。范围 2–50"
       },
       "enable_dense_trigger": {
         "description": "启用密集发言参与",
@@ -164,7 +166,7 @@
         "description": "启用定时一瞥 (GLANCE)",
         "type": "bool",
         "default": true,
-        "hint": "随机间隔瞄一眼群聊，由角色决定是否搭话；任务持久化到 AstrBot 的 data 目录"
+        "hint": "随机间隔瞄一眼群聊，由角色决定是否搭话。任务会持久化到 AstrBot 的 data 目录"
       },
       "glance_min_minutes": {
         "description": "一瞥最小间隔（分）",

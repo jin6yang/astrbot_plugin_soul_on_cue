@@ -18,6 +18,9 @@ from astrbot.core.message.components import At, Image, Plain, Reply
 from astrbot.core.message.message_event_result import MessageChain, ResultContentType
 
 
+MESSAGE_CACHE_LIMIT = 50
+
+
 DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请代入以下角色，判断看到群聊对话后是否想开口。
 
 <角色设定>
@@ -65,7 +68,7 @@ GLANCE_GENERATE_PROMPT = """你要以群聊角色的身份自然开口说一句�
 
 @dataclass
 class ChatFacts:
-    messages: deque = field(default_factory=lambda: deque(maxlen=50))
+    messages: deque = field(default_factory=lambda: deque(maxlen=MESSAGE_CACHE_LIMIT))
     reply_ts: deque = field(default_factory=deque)
     pending_replies: dict[str, float] = field(default_factory=dict)
     backoffs: dict = field(default_factory=dict)
@@ -518,7 +521,10 @@ class OnCuePlugin(Star):
         pure_text_parts = []
         image_count = 0
         other_count = 0
+        only_plain = True
         for comp in event.get_messages():
+            if not isinstance(comp, Plain):
+                only_plain = False
             if isinstance(comp, Plain):
                 text = (comp.text or "").strip()
                 if text:
@@ -548,6 +554,7 @@ class OnCuePlugin(Star):
             "role": "user",
             "text": text or "[空消息]",
             "pure_text": pure_text,
+            "is_pure_text": only_plain and bool(pure_text),
             "active": bool(text or image_count or other_count),
         }
 
@@ -624,6 +631,7 @@ class OnCuePlugin(Star):
             "role": "assistant",
             "text": text,
             "pure_text": "",
+            "is_pure_text": False,
             "active": False,
         })
         chat.reply_ts.append(now)
@@ -771,16 +779,27 @@ class OnCuePlugin(Star):
                 chat.decision_inflight = False
 
     def _stat_trigger_locked(self, chat: ChatFacts, item: dict, now: float) -> tuple[str, str] | None:
-        if self._cfg_bool("enable_echo_trigger", False) and item["pure_text"] and item["text"] == item["pure_text"]:
-            window = self._cfg_int("echo_window", 120)
-            threshold = self._cfg_int("echo_threshold", 3)
+        if self._cfg_bool("enable_echo_trigger", False) and item.get("is_pure_text", False):
+            window = max(2, min(self._cfg_int("echo_message_count", 5), MESSAGE_CACHE_LIMIT))
+            threshold = max(2, min(self._cfg_int("echo_threshold", 3), window))
             norm = re.sub(r"\s+", " ", item["pure_text"]).strip()
             if norm:
-                count = sum(1 for m in chat.messages if m.get("role", "user") == "user" and now - m["ts"] <= window and re.sub(r"\s+", " ", m["pure_text"]).strip() == norm)
+                # 先截取窗口；混合消息和自身回复占位置，但不贡献复读人数。
+                recent = list(chat.messages)[-window:]
+                participants = {
+                    m["sender_id"] for m in recent
+                    if m.get("role", "user") == "user" and m.get("is_pure_text", False)
+                    and re.sub(r"\s+", " ", m["pure_text"]).strip() == norm
+                }
+                count = len(participants)
                 key = f"echo:{norm}"
                 if count >= threshold and self._trigger_ready(chat, key, now):
-                    logger.info(f"[OnCue] 触发边命中: echo | {count}/{threshold} | {norm[:40]}")
-                    return "群里多人在复读同一句话。", key
+                    logger.info(f"[OnCue] 触发边命中: echo | 最近 {len(recent)} 条 | 人数 {count}/{threshold} | {norm[:40]}")
+                    return (
+                        f"最近 {len(recent)} 条群聊消息中，有 {count} 名不同成员重复了同一句纯文本："
+                        f"{json.dumps(norm, ensure_ascii=False)}。请结合角色性格和聊天语境，判断是否想参与。",
+                        key,
+                    )
         if self._cfg_bool("enable_dense_trigger", False):
             window = self._cfg_int("dense_window", 120)
             recent = [m for m in chat.messages if m.get("role", "user") == "user" and now - m["ts"] <= window and m["active"]]
