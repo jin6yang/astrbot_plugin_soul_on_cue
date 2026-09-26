@@ -19,6 +19,7 @@ from astrbot.core.message.message_event_result import MessageChain, ResultConten
 
 
 MESSAGE_CACHE_LIMIT = 50
+QUOTE_PREVIEW_LIMIT = 300
 
 
 DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请代入以下角色，判断看到群聊对话后是否想开口。
@@ -516,12 +517,71 @@ class OnCuePlugin(Star):
             logger.error(f"[OnCue] 自动读取人格失败，回退 manual: {e}")
         return manual
 
-    def _event_to_item(self, event: AstrMessageEvent) -> dict:
+    @staticmethod
+    def _participant_label(sender_id, name="", self_id="") -> str:
+        sender_id = str(sender_id or "").strip()
+        name = re.sub(r"\s+", " ", str(name or "")).strip()
+        if sender_id in {"0", "unknown"}:
+            sender_id = ""
+        if sender_id and sender_id == str(self_id):
+            return "Bot（你）"
+        label = f"成员「{name}」" if name and name != sender_id else "成员"
+        return f"{label}（ID={sender_id}）" if sender_id else f"{label}（身份未知）"
+
+    def _mention_text(self, comp: At, self_id: str) -> str:
+        target_id = getattr(comp, "qq", "")
+        if str(target_id) == "all":
+            return "[提及全体成员]"
+        target = self._participant_label(target_id, getattr(comp, "name", ""), self_id)
+        return f"[提及 {target}]"
+
+    def _quote_content(self, comp: Reply, self_id: str) -> str:
+        parts = []
+        for quoted in getattr(comp, "chain", None) or []:
+            if isinstance(quoted, Plain):
+                parts.append(quoted.text or "")
+            elif isinstance(quoted, Image):
+                parts.append("[图片]")
+            elif isinstance(quoted, At):
+                parts.append(self._mention_text(quoted, self_id))
+            elif isinstance(quoted, Reply):
+                # 引文只展开一层，避免嵌套引用不断放大上下文。
+                parts.append("[嵌套引用]")
+            else:
+                parts.append("[附件]")
+        return " ".join(parts).strip() or str(
+            getattr(comp, "message_str", "") or getattr(comp, "text", "") or ""
+        ).strip()
+
+    def _reply_text(self, comp: Reply, self_id: str, chat: ChatFacts | None) -> str:
+        message_id = str(getattr(comp, "id", "") or "").strip()
+        sender_id = str(getattr(comp, "sender_id", "") or "").strip()
+        if sender_id in {"0", "unknown"}:
+            sender_id = ""
+        sender_name = getattr(comp, "sender_nickname", "") or ""
+        content = self._quote_content(comp, self_id)
+        # 只用同一会话中 ID 精确匹配的原消息补齐，不能按昵称或相邻位置猜测。
+        if chat is not None and message_id:
+            source = next((m for m in reversed(chat.messages) if m.get("message_id") == message_id), None)
+            if source is not None:
+                sender_id = sender_id or source["sender_id"]
+                sender_name = sender_name or source["sender_name"]
+                content = content or source["text"]
+        author = self._participant_label(sender_id, sender_name, self_id)
+        preview = re.sub(r"\s+", " ", content).strip()
+        if len(preview) > QUOTE_PREVIEW_LIMIT:
+            preview = preview[:QUOTE_PREVIEW_LIMIT] + "…"
+        reference = f"消息ID={json.dumps(message_id, ensure_ascii=False)}" if message_id else "消息ID未知"
+        excerpt = f"摘录={json.dumps(preview, ensure_ascii=False)}" if preview else "原文未知"
+        return f"[引用 {reference}；作者={author}；{excerpt}]"
+
+    def _event_to_item(self, event: AstrMessageEvent, chat: ChatFacts | None = None) -> dict:
         parts = []
         pure_text_parts = []
         image_count = 0
         other_count = 0
         only_plain = True
+        self_id = str(event.get_self_id())
         for comp in event.get_messages():
             if not isinstance(comp, Plain):
                 only_plain = False
@@ -533,9 +593,9 @@ class OnCuePlugin(Star):
             elif isinstance(comp, Image):
                 image_count += 1
             elif isinstance(comp, At):
-                name = getattr(comp, "name", "") or getattr(comp, "qq", "")
-                if name:
-                    parts.append(f"[At:{name}]")
+                parts.append(self._mention_text(comp, self_id))
+            elif isinstance(comp, Reply):
+                parts.append(self._reply_text(comp, self_id, chat))
             else:
                 other_count += 1
         text = " ".join(parts).strip()
@@ -547,6 +607,7 @@ class OnCuePlugin(Star):
         sender = getattr(getattr(event, "message_obj", None), "sender", None)
         sender_name = getattr(sender, "nickname", "") or str(event.get_sender_id())
         return {
+            "message_id": str(getattr(getattr(event, "message_obj", None), "message_id", "") or ""),
             "ts": time.time(),
             "time_str": datetime.now().strftime("%H:%M:%S"),
             "sender_id": str(event.get_sender_id()),
@@ -619,7 +680,19 @@ class OnCuePlugin(Star):
     def _history_text(self, chat: ChatFacts) -> str:
         count = max(1, self._cfg_int("context_message_count", 20))
         rows = list(chat.messages)[-count:]
-        return "\n".join(f"[{m['sender_name']}/{m['time_str']}]: {m['text']}" for m in rows)
+        if not rows:
+            return ""
+        lines = []
+        for m in rows:
+            sender = "Bot（你）" if m.get("role") == "assistant" else self._participant_label(m["sender_id"], m["sender_name"])
+            message_id = m.get("message_id", "")
+            reference = f" / 消息ID={json.dumps(message_id, ensure_ascii=False)}" if message_id else ""
+            lines.append(f"[{sender} / {m['time_str']}{reference}]: {m['text']}")
+        return (
+            "群聊记录按顺序逐条列出；引用摘录是旧消息，不是当前发言。"
+            "请结合提及和引用区分对话对象，面向其他成员的话不等于向你提问；连续消息可能属于不同话题。\n"
+            + "\n".join(lines)
+        )
 
     def _record_reply(self, chat: ChatFacts, text: str, now: float) -> None:
         """在持有会话锁时记录发送结果；自身发言只供决策参考。"""
@@ -821,7 +894,7 @@ class OnCuePlugin(Star):
         async with chat.lock:
             now = time.time()
             observing = self._is_observing(chat, now)
-            item = self._event_to_item(event)
+            item = self._event_to_item(event, chat)
             chat.messages.append(item)
             if item["active"]:
                 chat.last_activity_ts = now
