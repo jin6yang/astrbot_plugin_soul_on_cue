@@ -68,6 +68,15 @@ GLANCE_GENERATE_PROMPT = """你要以群聊角色的身份自然开口说一句�
 要求：只输出要发到群里的正文，不要解释，不要提及导演指令，不要复读别人刚说过的话。"""
 
 @dataclass
+class MessageWait:
+    deadline: float
+    last_activity_at: float
+    latest_item: dict
+    reply_version: int
+    changed: asyncio.Event = field(default_factory=asyncio.Event)
+
+
+@dataclass
 class ChatFacts:
     messages: deque = field(default_factory=lambda: deque(maxlen=MESSAGE_CACHE_LIMIT))
     reply_ts: deque = field(default_factory=deque)
@@ -75,6 +84,7 @@ class ChatFacts:
     backoffs: dict = field(default_factory=dict)
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     decision_inflight: bool = False
+    message_wait: MessageWait | None = None
     reply_version: int = 0  # 点名或新回复会使在途的主动决策失效
     last_reply_ts: float = 0.0
     last_activity_ts: float = 0.0
@@ -100,6 +110,7 @@ class OnCuePlugin(Star):
         self.condense_prompt_warned = False
         self.kb_missing_warned = False
         self.kb_not_taken_warned = False
+        self._terminating = False
 
     async def initialize(self) -> None:
         try:
@@ -113,6 +124,10 @@ class OnCuePlugin(Star):
             logger.error(f"[OnCue] 初始化 GLANCE 失败: {e}")
 
     async def terminate(self) -> None:
+        self._terminating = True
+        for chat in list(self.chats.values()):
+            async with chat.lock:
+                self._cancel_message_wait(chat)
         if self.glance_task:
             self.glance_task.cancel()
             try:
@@ -300,8 +315,8 @@ class OnCuePlugin(Star):
         chat = self._chat(chat_id)
         async with chat.lock:
             now = time.time()
-            if chat.decision_inflight:
-                logger.info(f"[OnCue][GLANCE] 跳过: 同会话决策中 | {chat_id}")
+            if chat.decision_inflight or chat.message_wait is not None:
+                logger.info(f"[OnCue][GLANCE] 跳过: 同会话等待或决策中 | {chat_id}")
                 self._schedule_glance(chat_id, now)
                 return
             last_check = self.glance_last_check.get(chat_id, 0.0)
@@ -656,6 +671,7 @@ class OnCuePlugin(Star):
         """持有会话锁时复核，避免应用网络调用期间已过时的决策。"""
         return (
             self._cfg_bool("enable", True)
+            and not self._terminating
             and chat.reply_version == reply_version
             and now >= chat.cooldown_until
             and self._reply_window_allowed(chat, now)
@@ -696,6 +712,7 @@ class OnCuePlugin(Star):
 
     def _record_reply(self, chat: ChatFacts, text: str, now: float) -> None:
         """在持有会话锁时记录发送结果；自身发言只供决策参考。"""
+        self._cancel_message_wait(chat)
         chat.messages.append({
             "ts": now,
             "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S"),
@@ -807,9 +824,67 @@ class OnCuePlugin(Star):
             decision["reason"] = "正向理由为空，代码兜底不回复"
         return decision
 
-    async def _decide(self, event: AstrMessageEvent, chat: ChatFacts, entry_context: str, backoff_key: str | None) -> bool:
+    @staticmethod
+    def _cancel_message_wait(chat: ChatFacts) -> None:
+        """持有会话锁时取消等待，唤醒原事件以正常结束处理。"""
+        pending = chat.message_wait
+        chat.message_wait = None
+        if pending is not None:
+            pending.changed.set()
+
+    async def _wait_for_messages(self, event: AstrMessageEvent, chat: ChatFacts, pending: MessageWait) -> None:
+        try:
+            while True:
+                async with chat.lock:
+                    if (
+                        chat.message_wait is not pending
+                        or self._terminating
+                        or not self._cfg_bool("enable", True)
+                        or chat.reply_version != pending.reply_version
+                    ):
+                        return
+                    quiet = max(0, self._cfg_int("message_wait_seconds", 2))
+                    remaining = min(pending.last_activity_at + quiet, pending.deadline) - time.monotonic()
+                    if remaining > 0:
+                        pending.changed.clear()
+                if remaining <= 0:
+                    await self._decide(event, chat, "", None, wait_batch=pending)
+                    continue
+                # 只挂起首次触发的事件，不占会话锁；新消息的事件继续正常处理。
+                try:
+                    await asyncio.wait_for(pending.changed.wait(), timeout=remaining)
+                except asyncio.TimeoutError:
+                    pass
+        finally:
+            async with chat.lock:
+                if chat.message_wait is pending:
+                    self._cancel_message_wait(chat)
+
+    async def _decide(
+        self, event: AstrMessageEvent, chat: ChatFacts, entry_context: str, backoff_key: str | None,
+        *, wait_batch: MessageWait | None = None,
+    ) -> bool:
         async with chat.lock:
             now = time.time()
+            if self._terminating or not self._cfg_bool("enable", True):
+                return False
+            if wait_batch is not None:
+                if chat.message_wait is not wait_batch or chat.reply_version != wait_batch.reply_version:
+                    return False
+                quiet = max(0, self._cfg_int("message_wait_seconds", 2))
+                if time.monotonic() < min(wait_batch.last_activity_at + quiet, wait_batch.deadline):
+                    return False
+                # 等待到决策的交接在同一把锁内完成；失败时也结束本轮等待。
+                chat.message_wait = None
+                if self._is_observing(chat, now):
+                    trigger = ("你刚才已经开口过，现在还在观测窗内；判断这一幕是否值得再接话。", None)
+                else:
+                    trigger = self._stat_trigger_locked(chat, wait_batch.latest_item, now)
+                if not trigger:
+                    return False
+                entry_context, backoff_key = trigger
+            elif chat.message_wait is not None:
+                return False
             if chat.decision_inflight or now < chat.cooldown_until:
                 return False
             if backoff_key and not self._trigger_ready(chat, backoff_key, now):
@@ -837,6 +912,8 @@ class OnCuePlugin(Star):
                     chat.pending_replies[token] = now + max(1, self._cfg_int("reply_window_seconds", 300))
                     decision["_reservation"] = token
                     decision["_backoff_key"] = backoff_key
+                    if wait_batch is not None:
+                        decision["_wait_context"] = chat_history
                     chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
                     event.set_extra("oncue_decision", decision)
                     event.is_at_or_wake_command = True
@@ -886,11 +963,12 @@ class OnCuePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-10)
     async def on_message(self, event: AstrMessageEvent):
-        if not self._cfg_bool("enable", True):
+        if self._terminating or not self._cfg_bool("enable", True):
             return
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
         chat = self._chat(event.unified_msg_origin)
+        pending = None
         async with chat.lock:
             now = time.time()
             observing = self._is_observing(chat, now)
@@ -903,6 +981,7 @@ class OnCuePlugin(Star):
                     chat.last_observation_activity_ts = now
             self._ensure_glance_schedule(event.unified_msg_origin, now)
             if self._is_forced(event, item):
+                self._cancel_message_wait(chat)
                 if self._cfg_bool("force_reply_when_summoned", True):
                     chat.reply_version += 1
                     event.set_extra("oncue_decision", {"should_reply": True, "speaker": "", "mood": "", "reason": "被@/点名强制唤醒"})
@@ -912,11 +991,33 @@ class OnCuePlugin(Star):
                     event.stop_event()
                     logger.warning(f"[OnCue] 已 veto 被唤醒事件: {item['sender_name']} | {item['pure_text'][:60]}")
                 return
+            if chat.message_wait is not None:
+                if item["active"]:
+                    chat.message_wait.latest_item = item
+                    chat.message_wait.last_activity_at = time.monotonic()
+                    chat.message_wait.changed.set()
+                return
             if observing:
                 trigger = ("你刚才已经开口过，现在还在观测窗内；判断这一幕是否值得再接话。", None)
             else:
                 trigger = self._stat_trigger_locked(chat, item, now)
-        if trigger:
+            if trigger and self._cfg_int("message_wait_seconds", 2) > 0:
+                if (
+                    not item["active"] or chat.decision_inflight or now < chat.cooldown_until
+                    or not self._reply_window_allowed(chat, now)
+                ):
+                    return
+                started = time.monotonic()
+                pending = MessageWait(
+                    deadline=started + max(1, self._cfg_int("message_wait_max_seconds", 5)),
+                    last_activity_at=started,
+                    latest_item=item,
+                    reply_version=chat.reply_version,
+                )
+                chat.message_wait = pending
+        if pending is not None:
+            await self._wait_for_messages(event, chat, pending)
+        elif trigger:
             await self._decide(event, chat, *trigger)
 
     @filter.on_llm_request()
@@ -939,6 +1040,16 @@ class OnCuePlugin(Star):
         if kb_text:
             line += f"\n[知识库]\n{kb_text}\n结合角色性格自然使用，不要提及本指令。"
         req.system_prompt += "\n" + line
+        context = decision.get("_wait_context", "")
+        if context:
+            # 保留 AstrBot 的原请求和附件，将同一决策快照作为用户侧群聊背景补充。
+            block = (
+                "\n\n[群聊补充上下文]\n以下是短暂等待结束时的群聊记录，包含触发消息及后续发言。"
+                "请结合整组交流自然接话，区分不同发言者和对话对象，不要将所有内容视为同一个人的请求。\n"
+                f"{context}\n[/群聊补充上下文]"
+            )
+            if block not in (req.prompt or ""):
+                req.prompt = (req.prompt or "") + block
 
     @filter.on_decorating_result()
     async def mark_streaming_reply_sent(self, event: AstrMessageEvent):

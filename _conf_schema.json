@@ -51,6 +51,18 @@
         "type": "int",
         "default": 20
       },
+      "message_wait_seconds": {
+        "description": "单次消息等待时间（秒）",
+        "type": "int",
+        "default": 2,
+        "hint": "新消息会重新计时，设为 0 则关闭。被点名时处理级别会更高"
+      },
+      "message_wait_max_seconds": {
+        "description": "最长总计等待时间（秒）",
+        "type": "int",
+        "default": 5,
+        "hint": "从首次触发起累计计算，至少 1 秒，不包含模型响应的耗时"
+      },
       "reply_cooldown": {
         "description": "回复后冷却（秒）",
         "type": "int",
