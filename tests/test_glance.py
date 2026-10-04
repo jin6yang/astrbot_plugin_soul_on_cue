@@ -16,7 +16,7 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(clock.stop)
         self.plugin = plugin_module.OnCuePlugin(
             SimpleNamespace(send_message=AsyncMock(return_value=True)),
-            {"enable_glance": True, "enable_dense_trigger": False, "enable_echo_trigger": False},
+            {"enable_glance": True, "enable_dense_trigger": False, "enable_echo_trigger": False, "message_wait_seconds": 0},
         )
         self.chat_id = _event().unified_msg_origin
         self.chat = self.plugin._chat(self.chat_id)

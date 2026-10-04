@@ -101,7 +101,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(clock.stop)
         self.plugin = plugin_module.OnCuePlugin(
             SimpleNamespace(send_message=AsyncMock(return_value=True)),
-            {"enable_glance": False, "enable_dense_trigger": False, "enable_echo_trigger": False},
+            {"enable_glance": False, "enable_dense_trigger": False, "enable_echo_trigger": False, "message_wait_seconds": 0},
         )
         self.event = _event()
         self.chat_id = self.event.unified_msg_origin

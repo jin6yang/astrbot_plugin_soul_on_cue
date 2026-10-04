@@ -15,7 +15,7 @@ class EchoTests(unittest.IsolatedAsyncioTestCase):
         self.addCleanup(clock.stop)
         self.plugin = plugin_module.OnCuePlugin(
             SimpleNamespace(),
-            {"enable_echo_trigger": True, "enable_dense_trigger": False, "enable_glance": False},
+            {"enable_echo_trigger": True, "enable_dense_trigger": False, "enable_glance": False, "message_wait_seconds": 0},
         )
         self.chat = self.plugin._chat(_event().unified_msg_origin)
         self.plugin._decision_card = AsyncMock(return_value="测试角色")

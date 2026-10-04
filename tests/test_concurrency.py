@@ -25,7 +25,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
                 get_current_chat_provider_id=AsyncMock(return_value="main"),
                 llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text="glance reply")),
             ),
-            {"enable_glance": True, "enable_dense_trigger": False, "enable_echo_trigger": False},
+            {"enable_glance": True, "enable_dense_trigger": False, "enable_echo_trigger": False, "message_wait_seconds": 0},
         )
         self.event = _event("first topic")
         self.chat_id = self.event.unified_msg_origin

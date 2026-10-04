@@ -34,7 +34,7 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
                 get_current_chat_provider_id=AsyncMock(return_value="main"),
                 llm_generate=AsyncMock(return_value=SimpleNamespace(completion_text="reply")),
             ),
-            {"enable_glance": False, "enable_echo_trigger": False, "enable_dense_trigger": False},
+            {"enable_glance": False, "enable_echo_trigger": False, "enable_dense_trigger": False, "message_wait_seconds": 0},
         )
         self.chat = self.plugin._chat(_event().unified_msg_origin)
         self.plugin._decision_card = AsyncMock(return_value="角色卡")
