@@ -668,11 +668,6 @@ class OnCuePlugin(Star):
 
     async def _build_prompt(self, chat_history: str, entry_context: str, umo: str, platform_name: str = "") -> str:
         template = self._cfg_str("decision_prompt") or DEFAULT_DECISION_PROMPT
-        # 兼容旧配置保存的默认规则，避免“先决策”仍被旧提示词要求必须回复。
-        template = template.replace(
-            "有人明确@或点名你、或直接向你提问 → 必须回应",
-            "有人明确@或点名你、或直接向你提问 → 优先考虑回应，仍可根据角色和语境保持沉默",
-        )
         card = await self._decision_card(umo, platform_name) or "（未填写角色卡；按谨慎、不插话处理）"
         mapping = {
             "{character_card}": card,
