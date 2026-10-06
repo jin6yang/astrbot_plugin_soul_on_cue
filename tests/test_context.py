@@ -208,8 +208,12 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
     async def test_glance_generation_receives_the_same_relationship_context(self):
         self.cache(self.event(reply("m1", sender_id="bob", message_str="值班吗"), Plain("明天")))
         history = self.plugin._history_text(self.chat)
-        await self.plugin._glance_generate(history, _event().unified_msg_origin, {})
-        prompt = self.plugin.context.llm_generate.call_args.kwargs["prompt"]
+        event = _event()
+        event.set_extra("oncue_decision", {"should_reply": True, "_chat_context": history})
+        req = SimpleNamespace(system_prompt="原生人格", prompt="主动发言机会")
+        await self.plugin.inject_stage_direction(event, req)
+        prompt = req.prompt
+        self.assertTrue(req.system_prompt.startswith("原生人格"))
         self.assertIn(history, prompt)
         self.assertIn("作者=成员（ID=bob）", prompt)
 

@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_timing import Plain, ResultContentType, _event, plugin_module
+from test_timing import _native_pipeline, Plain, ResultContentType, _event, plugin_module
 
 
 class ReplyTests(unittest.IsolatedAsyncioTestCase):
@@ -23,8 +23,7 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.chat = self.plugin._chat(self.chat_id)
         self.plugin._build_prompt = AsyncMock(return_value="prompt")
         self.plugin._llm_decision = AsyncMock(return_value='{"should_reply": true, "reason": "topic"}')
-        self.plugin._glance_generate = AsyncMock(return_value="glance reply")
-        self.plugin._append_assistant_history = AsyncMock()
+        _native_pipeline(self.plugin, "glance reply")
         self.plugin._glance_interval_seconds = lambda: 900.0
 
     async def decide(self):
@@ -162,17 +161,16 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.chat.messages[-1]["role"], "assistant")
         self.assertEqual(self.chat.last_activity_ts, 950.0)
         self.assertEqual(list(self.chat.reply_ts), [1000.0])
-        self.plugin._append_assistant_history.assert_awaited_once_with(self.chat_id, "glance reply")
+        self.plugin.native_history.assert_awaited_once_with(self.chat_id, "glance reply")
 
     async def test_glance_failed_send_does_not_update_either_history(self):
         self.chat.last_activity_ts = 950.0
         self.plugin.context.send_message.return_value = False
-        with self.assertLogs(plugin_module.logger, level="WARNING"):
-            await self.plugin._glance_due(self.chat_id)
+        await self.plugin._glance_due(self.chat_id)
         self.assertEqual(list(self.chat.messages), [])
         self.assertEqual(list(self.chat.reply_ts), [])
         self.assertEqual(self.chat.last_reply_ts, 0.0)
-        self.plugin._append_assistant_history.assert_not_awaited()
+        self.plugin.native_history.assert_not_awaited()
 
     async def test_bot_replies_do_not_contribute_to_echo_or_density(self):
         self.plugin.config.update(

@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_timing import _event, plugin_module
+from test_timing import _native_pipeline, _event, plugin_module
 
 
 class GlanceTests(unittest.IsolatedAsyncioTestCase):
@@ -24,8 +24,7 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.glance_last_check[self.chat_id] = 900.0
         self.plugin._build_prompt = AsyncMock(return_value="prompt")
         self.plugin._llm_decision = AsyncMock(return_value='{"should_reply": false}')
-        self.plugin._glance_generate = AsyncMock(return_value="reply")
-        self.plugin._append_assistant_history = AsyncMock()
+        _native_pipeline(self.plugin)
         self.plugin._glance_interval_seconds = lambda: 900.0
 
     async def assert_skipped_activity_is_checked_next_time(self):
@@ -141,13 +140,42 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
     async def test_valid_decision_is_checked_even_if_delivery_fails(self):
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
         self.plugin.context.send_message.return_value = False
-        with self.assertLogs(plugin_module.logger, level="WARNING"):
-            await self.plugin._glance_due(self.chat_id)
+        await self.plugin._glance_due(self.chat_id)
         self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.plugin._llm_decision.assert_awaited_once()
         self.assertEqual(list(self.chat.reply_ts), [])
+
+    async def test_native_tool_delivery_without_final_hook_is_counted_once(self):
+        self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
+
+        async def native(event):
+            event._has_send_oper = True
+            event.set_extra("_send_message_to_user_current_session_plain_texts", ["工具发出的正文"])
+
+        self.plugin._run_native_reply.side_effect = native
+        await self.plugin._glance_due(self.chat_id)
+        self.assertEqual(list(self.chat.reply_ts), [self.now])
+        self.assertEqual(self.chat.messages[-1]["text"], "工具发出的正文")
+        self.assertEqual(self.chat.pending_replies, {})
+
+    async def test_partial_delivery_is_counted_even_if_pipeline_later_fails(self):
+        self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
+
+        async def native(event):
+            from test_timing import Plain
+            event._has_send_oper = True
+            event.delivered = [Plain("已送达的第一段")]
+            raise RuntimeError("later segment failed")
+
+        self.plugin._run_native_reply.side_effect = native
+        with self.assertRaisesRegex(RuntimeError, "later segment failed"):
+            await self.plugin._glance_due(self.chat_id)
+        self.assertEqual(list(self.chat.reply_ts), [self.now])
+        self.assertEqual(self.chat.messages[-1]["text"], "已送达的第一段")
+        self.assertEqual(self.chat.pending_replies, {})
+        self.assertFalse(self.chat.glance_inflight)
 
 
 if __name__ == "__main__":

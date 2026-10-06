@@ -119,15 +119,16 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         await self.finish(task)
         self.plugin._llm_decision.assert_awaited_once()
 
-    async def test_zero_wait_restores_immediate_path_and_does_not_add_batch_context(self):
+    async def test_zero_wait_still_supplies_the_common_context(self):
         self.plugin.config["message_wait_seconds"] = 0
         await self.plugin.on_message(self.event)
         self.plugin._llm_decision.assert_awaited_once()
         self.assertIsNone(self.chat.message_wait)
-        self.assertNotIn("_wait_context", self.event.get_extra("oncue_decision"))
+        self.assertIn("_chat_context", self.event.get_extra("oncue_decision"))
         req = self.request()
         await self.plugin.inject_stage_direction(self.event, req)
-        self.assertEqual(req.prompt, "原始消息")
+        self.assertTrue(req.prompt.startswith("原始消息"))
+        self.assertIn(self.event.get_extra("oncue_decision")["_chat_context"], req.prompt)
 
     async def test_empty_message_does_not_restart_quiet_wait(self):
         task = await self.start()
@@ -158,18 +159,16 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(self.chat.message_wait)
         self.plugin._llm_decision.assert_not_awaited()
 
-    async def test_disabled_forced_reply_still_vetoes_and_cancels_wait(self):
+    async def test_decision_summon_cancels_wait_and_asks_model_immediately(self):
         task = await self.start()
         self.plugin.config["force_reply_when_summoned"] = False
         summoned = _event(summoned=True)
-        stopped = []
-        summoned.stop_event = lambda: stopped.append(True)
-        with self.assertLogs(plugin_module.logger, level="WARNING"):
-            await self.plugin.on_message(summoned)
+        await self.plugin.on_message(summoned)
         await self.finish(task)
-        self.assertEqual(stopped, [True])
-        self.assertIsNone(summoned.get_extra("oncue_decision"))
-        self.plugin._llm_decision.assert_not_awaited()
+        self.assertIsNone(self.chat.message_wait)
+        self.assertTrue(summoned.is_at_or_wake_command)
+        self.assertTrue(summoned.get_extra("oncue_decision")["should_reply"])
+        self.plugin._llm_decision.assert_awaited_once()
 
     async def test_old_wait_cleanup_cannot_clear_a_new_wait(self):
         old_task = await self.start()
@@ -348,7 +347,7 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await self.finish(task)
         self.plugin._llm_decision.assert_awaited_once()
-        context = self.event.get_extra("oncue_decision")["_wait_context"]
+        context = self.event.get_extra("oncue_decision")["_chat_context"]
         self.assertIn("等待阶段的补充", context)
         self.assertNotIn("模型开始后的新消息", context)
 
@@ -360,7 +359,7 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_message(second)
         await self.advance(2)
         await self.finish(task)
-        snapshot = self.event.get_extra("oncue_decision")["_wait_context"]
+        snapshot = self.event.get_extra("oncue_decision")["_chat_context"]
         self.assertIn(snapshot, self.plugin._llm_decision.call_args.args[1])
         req = self.request()
         await self.plugin.inject_stage_direction(self.event, req)

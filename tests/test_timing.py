@@ -38,6 +38,8 @@ def _event(text="hello", *, summoned=False):
         get_sender_id=lambda: "alice",
         get_self_id=lambda: "bot",
         get_platform_name=lambda: "test",
+        get_group_id=lambda: "1",
+        platform_meta=SimpleNamespace(name="test", id="test"),
         get_messages=lambda: [Plain(text)] if text else [],
         get_extra=extras.get,
         set_extra=extras.__setitem__,
@@ -45,6 +47,10 @@ def _event(text="hello", *, summoned=False):
         result=SimpleNamespace(chain=[], result_content_type=ResultContentType.LLM_RESULT),
     )
     event.get_result = lambda: event.result
+    event.set_result = lambda result: setattr(event, "result", result)
+    event.chain_result = lambda chain: SimpleNamespace(chain=chain, result_content_type=ResultContentType.LLM_RESULT)
+    event.stop_event = lambda: setattr(event, "stopped", True)
+    event.stopped = False
     return event
 
 
@@ -93,6 +99,38 @@ def _load_plugin():
 plugin_module = _load_plugin()
 
 
+def _native_pipeline(plugin, reply="reply"):
+    """在插件状态测试中替代原生管道；原生适配另有契约测试。"""
+    plugin.config["enable_glance"] = True
+    plugin.native_generate = AsyncMock(return_value=reply)
+    plugin.native_history = AsyncMock()
+
+    def create(chat):
+        event = _event("[主动发言机会]")
+        event.delivered = []
+        return event
+
+    async def run(event):
+        req = SimpleNamespace(prompt="[主动发言机会]", system_prompt="原生人格")
+        await plugin.inject_stage_direction(event, req)
+        if event.stopped:
+            return
+        text = await plugin.native_generate(prompt=req.prompt)
+        if not text or not await plugin._glance_can_send(plugin._chat(event.unified_msg_origin), event):
+            return
+        ok = await plugin.context.send_message(event.unified_msg_origin, [Plain(text)])
+        if not ok:
+            return
+        event._has_send_oper = True
+        event.delivered = [Plain(text)]
+        event.result.chain = event.delivered
+        await plugin.mark_reply_sent(event)
+        await plugin.native_history(event.unified_msg_origin, text)
+
+    plugin._create_glance_event = create
+    plugin._run_native_reply = AsyncMock(side_effect=run)
+
+
 class TimingTests(unittest.IsolatedAsyncioTestCase):
     def setUp(self):
         self.now = 1000.0
@@ -108,8 +146,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.chat = self.plugin._chat(self.chat_id)
         self.plugin._build_prompt = AsyncMock(return_value="prompt")
         self.plugin._llm_decision = AsyncMock(return_value='{"should_reply": false}')
-        self.plugin._glance_generate = AsyncMock(return_value="reply")
-        self.plugin._append_assistant_history = AsyncMock()
+        _native_pipeline(self.plugin)
         self.plugin._glance_interval_seconds = lambda: 900.0
 
     async def test_messages_cannot_start_observation_without_a_reply(self):
@@ -220,7 +257,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
             self.now += 15.0
             return '{"should_reply": true, "reason": "topic"}'
 
-        async def generate(*args):
+        async def generate(*args, **kwargs):
             self.now += 25.0
             return "reply"
 
@@ -230,14 +267,14 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
 
         self.chat.last_activity_ts = 950.0
         self.plugin._llm_decision.side_effect = decide
-        self.plugin._glance_generate.side_effect = generate
+        self.plugin.native_generate.side_effect = generate
         self.plugin.context.send_message.side_effect = send
         await self.plugin._glance_due(self.chat_id)
         self.assertEqual(self.chat.last_reply_ts, 1060.0)
         self.assertEqual(list(self.chat.reply_ts), [1060.0])
         self.assertEqual(self.chat.cooldown_until, 1070.0)
         self.assertEqual(self.plugin.glance_next_due[self.chat_id], 1960.0)
-        self.plugin._append_assistant_history.assert_awaited_once_with(self.chat_id, "reply")
+        self.plugin.native_history.assert_awaited_once_with(self.chat_id, "reply")
 
     async def test_glance_negative_decision_uses_completion_time(self):
         async def decide(*args):
@@ -250,19 +287,19 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.chat.cooldown_until, 1070.0)
         self.assertEqual(self.chat.backoffs["glance"]["until"], 1070.0)
         self.assertEqual(self.plugin.glance_next_due[self.chat_id], 1930.0)
-        self.plugin._glance_generate.assert_not_awaited()
+        self.plugin.native_generate.assert_not_awaited()
 
-    async def test_glance_empty_generation_uses_completion_time(self):
-        async def generate(*args):
+    async def test_glance_empty_generation_releases_reservation_and_schedules_from_completion(self):
+        async def generate(*args, **kwargs):
             self.now = 1050.0
             return ""
 
         self.chat.last_activity_ts = 950.0
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
-        self.plugin._glance_generate.side_effect = generate
+        self.plugin.native_generate.side_effect = generate
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.chat.cooldown_until, 1090.0)
-        self.assertEqual(self.chat.backoffs["glance"]["until"], 1090.0)
+        self.assertEqual(self.chat.pending_replies, {})
+        self.assertEqual(list(self.chat.reply_ts), [])
         self.assertEqual(self.plugin.glance_next_due[self.chat_id], 1950.0)
         self.plugin.context.send_message.assert_not_awaited()
 

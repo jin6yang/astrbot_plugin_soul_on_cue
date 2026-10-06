@@ -5,7 +5,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_timing import Plain, _event, plugin_module
+from test_timing import _native_pipeline, Plain, _event, plugin_module
 
 
 REPLY = '{"should_reply": true, "reason": "topic"}'
@@ -37,7 +37,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._character_card = AsyncMock(return_value="character card")
         self.plugin._llm_decision = AsyncMock(return_value=SILENT)
         self.plugin._kb_retrieve = AsyncMock(return_value="knowledge")
-        self.plugin._append_assistant_history = AsyncMock()
+        _native_pipeline(self.plugin, "glance reply")
         self.plugin._glance_interval_seconds = lambda: 900.0
         self.tasks = []
 
@@ -190,7 +190,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.plugin.on_message(_event(summoned=True)), 1)
         release.set()
         await task
-        self.plugin.context.llm_generate.assert_not_awaited()
+        self.plugin.native_generate.assert_not_awaited()
         self.plugin.context.send_message.assert_not_awaited()
         self.assertNotIn(self.chat_id, self.plugin.glance_last_check)
 
@@ -203,7 +203,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await task
         decision_prompt = self.plugin._llm_decision.call_args.args[1]
-        generation_prompt = self.plugin.context.llm_generate.call_args.kwargs["prompt"]
+        generation_prompt = self.plugin.native_generate.call_args.kwargs["prompt"]
         for prompt in (decision_prompt, generation_prompt):
             self.assertIn("old topic", prompt)
             self.assertNotIn("later topic", prompt)
@@ -213,7 +213,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
     async def test_glance_summon_during_generation_cancels_unsent_reply(self):
         self.plugin._llm_decision.return_value = REPLY
         entered, release = self.block(
-            self.plugin.context.llm_generate, SimpleNamespace(completion_text="old reply")
+            self.plugin.native_generate, "old reply"
         )
         task = self.start(self.plugin._glance_due(self.chat_id))
         await asyncio.wait_for(entered.wait(), 1)
@@ -236,11 +236,11 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.assertEqual(len(self.chat.reply_ts), 1)
         self.assertEqual(self.chat.messages[-1]["text"], "glance reply")
-        self.plugin._append_assistant_history.assert_awaited_once()
+        self.plugin.native_history.assert_awaited_once()
 
     async def test_glance_history_write_does_not_hold_chat_lock(self):
         self.plugin._llm_decision.return_value = REPLY
-        entered, release = self.block(self.plugin._append_assistant_history, None)
+        entered, release = self.block(self.plugin.native_history, None)
         task = self.start(self.plugin._glance_due(self.chat_id))
         await asyncio.wait_for(entered.wait(), 1)
         self.assertFalse(self.chat.lock.locked())
@@ -272,6 +272,8 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(asyncio.CancelledError):
             await task
         self.assertFalse(self.chat.decision_inflight)
+        self.assertFalse(self.chat.glance_inflight)
+        self.assertEqual(self.chat.pending_replies, {})
         self.assertFalse(self.chat.lock.locked())
         self.assertEqual(list(self.chat.reply_ts), [])
 
@@ -286,10 +288,12 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_glance_generation_exception_releases_busy_flag(self):
         self.plugin._llm_decision.return_value = REPLY
-        self.plugin._glance_generate = AsyncMock(side_effect=RuntimeError("generation failure"))
+        self.plugin.native_generate = AsyncMock(side_effect=RuntimeError("generation failure"))
         with self.assertRaisesRegex(RuntimeError, "generation failure"):
             await self.plugin._glance_due(self.chat_id)
         self.assertFalse(self.chat.decision_inflight)
+        self.assertFalse(self.chat.glance_inflight)
+        self.assertEqual(self.chat.pending_replies, {})
         self.assertFalse(self.chat.lock.locked())
 
     async def test_busy_flag_is_per_chat(self):
