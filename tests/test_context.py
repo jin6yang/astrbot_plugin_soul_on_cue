@@ -38,7 +38,6 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
         )
         self.chat = self.plugin._chat(_event().unified_msg_origin)
         self.plugin._decision_card = AsyncMock(return_value="角色卡")
-        self.plugin._character_card = AsyncMock(return_value="角色卡")
         self.plugin._llm_decision = AsyncMock(return_value='{"should_reply": false}')
 
     def event(self, *components, message_id="current", sender_id="alice", nickname="Alice"):

@@ -34,7 +34,6 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.chat.last_activity_ts = 950.0
         self.chat.messages.append(self.plugin._event_to_item(_event("old topic")))
         self.plugin._decision_card = AsyncMock(return_value="character card")
-        self.plugin._character_card = AsyncMock(return_value="character card")
         self.plugin._llm_decision = AsyncMock(return_value=SILENT)
         self.plugin._kb_retrieve = AsyncMock(return_value="knowledge")
         _native_pipeline(self.plugin, "glance reply")
