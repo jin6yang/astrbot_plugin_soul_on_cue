@@ -1,5 +1,4 @@
 import asyncio
-import hashlib
 import json
 import random
 import re
@@ -87,12 +86,7 @@ class OnCuePlugin(Star):
         self.glance_next_due: dict[str, float] = {}
         self.glance_last_check: dict[str, float] = {}  # 最近已完成决策的群聊活动时间
         self.glance_task: asyncio.Task | None = None
-        self.persona_cache: dict[str, tuple[float, str]] = {}
-        self.card_cache_file: Path | None = None
-        self.card_cache: dict[str, dict] = {}
-        self.card_fail_until: dict[str, float] = {}
-        self.card_op_lock = asyncio.Lock()
-        self.condense_prompt_warned = False
+        self._decision_card_issue: str | None = None
         self.kb_missing_warned = False
         self.kb_not_taken_warned = False
         self._terminating = False
@@ -101,9 +95,9 @@ class OnCuePlugin(Star):
         try:
             self.data_dir = StarTools.get_data_dir("astrbot_plugin_soul_on_cue")
             self.glance_file = self.data_dir / "glance.json"
-            self.card_cache_file = self.data_dir / "persona_cards.json"
             self._load_glance()
-            self._load_card_cache()
+            if self._cfg_bool("enable", True):
+                await self._decision_card()
             self.glance_task = asyncio.create_task(self._glance_loop())
         except Exception as e:
             logger.error(f"[OnCue] 初始化 GLANCE 失败: {e}")
@@ -133,7 +127,7 @@ class OnCuePlugin(Star):
             value = None
         if value is not None:
             return value
-        for section in ("config_wake", "config_decision", "config_condense", "config_trigger", "config_character"):
+        for section in ("config_wake", "config_decision", "config_trigger", "config_character"):
             try:
                 obj = self.config.get(section, {})
             except Exception:
@@ -183,78 +177,6 @@ class OnCuePlugin(Star):
             self.glance_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         except Exception as e:
             logger.error(f"[OnCue] 写入 GLANCE 持久化失败: {e}")
-
-    def _load_card_cache(self) -> None:
-        self.card_cache = {}
-        if not self.card_cache_file or not self.card_cache_file.exists():
-            return
-        try:
-            data = json.loads(self.card_cache_file.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                for key, value in data.items():
-                    if isinstance(value, dict) and value.get("card"):
-                        self.card_cache[str(key)] = value
-        except Exception as e:
-            logger.error(f"[OnCue] 读取决策卡缓存失败: {e}")
-
-    def _save_card_cache(self) -> None:
-        if not self.card_cache_file:
-            return
-        try:
-            self.card_cache_file.parent.mkdir(parents=True, exist_ok=True)
-            items = sorted(self.card_cache.items(), key=lambda kv: float(kv[1].get("created_ts", 0.0)), reverse=True)[:100]
-            payload = {key: value for key, value in items}
-            self.card_cache_file.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        except Exception as e:
-            logger.error(f"[OnCue] 写入决策卡缓存失败: {e}")
-
-    def _card_key(self, raw_card: str) -> str:
-        return hashlib.sha256(raw_card.encode("utf-8")).hexdigest()
-
-    async def _decision_card(self, umo: str, platform_name: str = "") -> str:
-        raw = await self._character_card(umo, platform_name)
-        mode = self._cfg_str("decision_card_mode", "raw")
-        max_chars = max(200, self._cfg_int("decision_card_max_chars", 1000))
-        if mode != "condense" or not raw.strip():
-            return raw
-        condense_prompt = self._cfg_str("decision_card_condense_prompt")
-        if "{raw_card}" not in condense_prompt:
-            if not self.condense_prompt_warned:
-                self.condense_prompt_warned = True
-                logger.error("[OnCue] 已选择自动浓缩，但浓缩提示词为空或缺少 {raw_card}，本次及后续直接使用原始角色卡")
-            return raw
-        key = self._card_key(condense_prompt + "\n" + str(max_chars) + "\n" + raw)
-        cached = self.card_cache.get(key)
-        if cached and cached.get("card"):
-            return str(cached["card"])
-        async with self.card_op_lock:
-            cached = self.card_cache.get(key)
-            if cached and cached.get("card"):
-                return str(cached["card"])
-            now = time.time()
-            if now < self.card_fail_until.get(key, 0.0):
-                return raw
-            provider_id = self._cfg_str("decision_card_condense_provider").strip() or self._cfg_str("analyzer_provider").strip()
-            try:
-                if not provider_id:
-                    provider_id = await self.context.get_current_chat_provider_id(umo=umo)
-                prompt = condense_prompt.replace("{max_chars}", str(max_chars)).replace("{raw_card}", raw)
-                resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
-                card = (resp.completion_text or "").strip()
-                if card.startswith("```"):
-                    card = card.strip("`").strip()
-                if len(card) > max_chars:
-                    logger.warning(f"[OnCue] 自动浓缩结果 {len(card)} 字超过目标 {max_chars} 字，按不截断保留")
-                if not card or card == raw:
-                    raise ValueError("浓缩结果为空")
-                self.card_cache[key] = {"card": card, "created_ts": now, "chars": len(card)}
-                self._save_card_cache()
-                logger.info(f"[OnCue] 决策卡已自动浓缩: {len(raw)} -> {len(card)} chars")
-                return card
-            except Exception as e:
-                self.card_fail_until[key] = now + 600
-                logger.error(f"[OnCue] 决策卡自动浓缩失败，10 分钟内回退原始卡: {e}")
-                return raw
 
     def _glance_interval_seconds(self) -> float:
         minutes_min = self._cfg_int("glance_min_minutes", 15)
@@ -404,70 +326,36 @@ class OnCuePlugin(Star):
             logger.error(f"[OnCue] 知识库检索失败，按无资料处理: {e}")
             return ""
 
-    async def _character_card(self, umo: str, platform_name: str = "") -> str:
-        manual = self._cfg_str("character_card")
-        source = self._cfg_str("persona_source", "persona_id")
-        if source == "persona_id":
-            selected_persona_id = self._cfg_str("persona_id").strip()
-            if not selected_persona_id:
-                return manual
-            selected_persona = self.context.persona_manager.get_persona_v3_by_id(selected_persona_id)
-            if selected_persona and selected_persona.get("prompt"):
-                card = str(selected_persona.get("prompt"))
-                self.persona_cache[umo] = (time.time(), card)
-                logger.info(f"[OnCue] 使用显式人格: {selected_persona_id} (chars={len(card)})")
-                return card
-            logger.error(f"[OnCue] 指定人格 ID 无可用 prompt，回退手工角色卡: persona_id={selected_persona_id}")
-            return manual
-        if source != "auto":
-            return manual
-        cached = self.persona_cache.get(umo)
-        now = time.time()
-        if cached and cached[1] and now - cached[0] < 10:
-            return cached[1]
+    def _report_decision_card_issue(self, issue: str) -> None:
+        # 相同配置问题只报一次；配置恢复或问题变化后可再次提示。
+        if issue != self._decision_card_issue:
+            logger.error(
+                f"[OnCue][决策卡不可用] {issue}；已跳过 LLM 决策。"
+                "请在插件设置「角色设定 → 决策卡」中选择有效且有内容的人格。"
+            )
+            self._decision_card_issue = issue
+
+    async def _decision_card(self) -> str | None:
+        persona_id = self._cfg_str("persona_id").strip()
+        if not persona_id:
+            self._report_decision_card_issue("未选择决策卡")
+            return None
         try:
-            conv_mgr = self.context.conversation_manager
-            cid = await conv_mgr.get_curr_conversation_id(umo)
-            conversation_persona_id = None
-            if cid:
-                conv = await conv_mgr.get_conversation(umo, cid)
-                conversation_persona_id = getattr(conv, "persona_id", None) if conv else None
-            cfg = self.context.get_config(umo=umo).get("provider_settings", {})
-            default_persona_id = cfg.get("default_personality")
-            persona_id, persona, forced_persona_id, _ = await self.context.persona_manager.resolve_selected_persona(
-                umo=umo,
-                conversation_persona_id=conversation_persona_id,
-                platform_name=platform_name or umo.split(":", 1)[0],
-                provider_settings=cfg,
-            )
-            if persona and persona.get("prompt"):
-                card = str(persona.get("prompt"))
-                self.persona_cache[umo] = (now, card)
-                return card
-            if conversation_persona_id == "[%None]":
-                logger.info(f"[OnCue] persona auto 为空: 当前会话显式无人格; cid={cid}; resolved={persona_id}")
-                return manual
-            if conversation_persona_id:
-                conv_persona = self.context.persona_manager.get_persona_v3_by_id(conversation_persona_id)
-                if conv_persona and conv_persona.get("prompt"):
-                    card = str(conv_persona.get("prompt"))
-                    self.persona_cache[umo] = (now, card)
-                    return card
-            default_persona = await self.context.persona_manager.get_default_persona_v3(umo)
-            if default_persona and default_persona.get("prompt") and default_persona.get("name") != "default":
-                card = str(default_persona.get("prompt"))
-                self.persona_cache[umo] = (now, card)
-                return card
-            personas_v3_count = len(getattr(self.context.persona_manager, "personas_v3", []) or [])
-            logger.info(
-                "[OnCue] persona auto 未取到角色卡，回退 manual: "
-                f"cid={cid}; conversation_persona_id={conversation_persona_id}; "
-                f"default_personality={default_persona_id}; resolved={persona_id}; "
-                f"forced={forced_persona_id}; personas_v3={personas_v3_count}"
-            )
+            persona = self.context.persona_manager.get_persona_v3_by_id(persona_id)
         except Exception as e:
-            logger.error(f"[OnCue] 自动读取人格失败，回退 manual: {e}")
-        return manual
+            self._report_decision_card_issue(f"读取决策卡失败（人格 ID={persona_id}）：{e}")
+            return None
+        if persona is None:
+            self._report_decision_card_issue(f"选中的人格不存在或已被删除（人格 ID={persona_id}）")
+            return None
+        card = persona.get("prompt")
+        if not isinstance(card, str) or not card.strip():
+            self._report_decision_card_issue(f"选中的人格没有有效内容（人格 ID={persona_id}）")
+            return None
+        if self._decision_card_issue is not None:
+            logger.info(f"[OnCue] 决策卡已恢复可用（人格 ID={persona_id}）")
+            self._decision_card_issue = None
+        return card
 
     @staticmethod
     def _participant_label(sender_id, name="", self_id="") -> str:
@@ -666,9 +554,11 @@ class OnCuePlugin(Star):
         chat.last_reply_ts = now
         chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
 
-    async def _build_prompt(self, chat_history: str, entry_context: str, umo: str, platform_name: str = "") -> str:
+    async def _build_prompt(self, chat_history: str, entry_context: str) -> str | None:
         template = self._cfg_str("decision_prompt") or DEFAULT_DECISION_PROMPT
-        card = await self._decision_card(umo, platform_name) or "（未填写角色卡；按谨慎、不插话处理）"
+        card = await self._decision_card()
+        if card is None:
+            return None
         mapping = {
             "{character_card}": card,
             "{current_time}": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -813,13 +703,15 @@ class OnCuePlugin(Star):
             if not summoned and not self._reply_window_allowed(chat, now):
                 return False
             source = "summoned" if summoned else backoff_key or "observe"
-            logger.info(f"[OnCue] 决策调用: source={source} | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
             chat_history = self._history_text(chat)
             reply_version = chat.reply_version
             owner = object()
             chat.decision_inflight = owner
         try:
-            prompt = await self._build_prompt(chat_history, entry_context, event.unified_msg_origin, event.get_platform_name())
+            prompt = await self._build_prompt(chat_history, entry_context)
+            if prompt is None:
+                return False
+            logger.info(f"[OnCue] 决策调用: source={source} | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
             raw = await self._llm_decision(event.unified_msg_origin, prompt)
             decision = self._parse_decision(raw)
             if decision["should_reply"] and decision.get("need_kb"):
