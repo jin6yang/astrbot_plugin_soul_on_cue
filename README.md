@@ -29,19 +29,17 @@ Astrbot 插件 - 应场
 > [!NOTE]
 > 本插件为自用插件
 >
-> 本插件即将上架 AstrBot 插件市场
->
 > 英文翻译将于之后推出......
 >
 > 本插件项目因为以上原因，可能无法及时响应和解决 Issues 和 PR
 
 > [!TIP]
-> 本项目受到了 [astrbot_plugin_angel_heart](https://github.com/kawayiYokami/astrbot_plugin_angel_heart) 项目的启发并借鉴了部分思路
+> 本项目受到了 [AngelHeart](https://github.com/kawayiYokami/astrbot_plugin_angel_heart) 和 [Neuro SDK](https://github.com/VedalAI/neuro-sdk) 项目的启发
 
 > [!IMPORTANT]
 > 本项目支持与作者的其它 AstrBot 插件项目联动
 >
-> - [astrbot_plugin_external_knowledgebase](https://github.com/jin6yang/astrbot_plugin_external_knowledgebase)
+> - [External Knowledge Base Retrieval](https://github.com/jin6yang/astrbot_plugin_external_knowledgebase)
 
 ## 主要功能和特色
 
@@ -64,7 +62,6 @@ Astrbot 插件 - 应场
 
 - 🔔 唤醒与观测
 - 🧠 决策层基础
-- 🤯 角色卡浓缩
 - 🕹️ 触发器
 - 🎭 角色设定
 
@@ -76,21 +73,22 @@ Linux / macOS / OpenHarmony: 请根据 AstrBot 部署方式查找对应的目录
 
 ## Q/A
 
-如果碰到一些奇怪的 Bug, 建议先重启 AstrBot 的后端。
+如果碰到一些奇怪的 Bug, 建议先重启 AstrBot 的后端再试。
 
-## 感谢
+## 致谢
 
 [Dependencies](https://github.com/jin6yang/astrbot_plugin_agent_browser/network/dependencies)
 
 [AstrBot✨](https://github.com/AstrBotDevs/AstrBot)
 
-[astrbot_plugin_angel_heart](https://github.com/kawayiYokami/astrbot_plugin_angel_heart)
+[AngelHeart](https://github.com/kawayiYokami/astrbot_plugin_angel_heart)
+
+[Neuro SDK](https://github.com/VedalAI/neuro-sdk)
 
 ## 开发支持
 
 - [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+- [AstrBot Plugin Development Docs](https://docs.astrbot.app/dev/star/plugin-new.html)
 
 ## 许可证
 
