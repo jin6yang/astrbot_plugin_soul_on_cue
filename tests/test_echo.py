@@ -164,12 +164,14 @@ class EchoTests(unittest.IsolatedAsyncioTestCase):
                 self.assertIsNotNone(self.trigger())
 
     def test_large_window_and_threshold_are_limited_by_cache_capacity(self):
+        self.plugin.config["config_context"] = {"message_cache_count": 60}
+        self.plugin._resize_message_cache(self.chat)
         self.plugin.config.update(echo_message_count=100, echo_threshold=100)
-        for sender in range(49):
+        for sender in range(59):
             self.cache(str(sender))
         self.assertIsNone(self.trigger())
-        self.cache("49")
-        self.assertIn("最近 50 条群聊消息中，有 50 名不同成员", self.trigger()[0])
+        self.cache("59")
+        self.assertIn("最近 60 条群聊消息中，有 60 名不同成员", self.trigger()[0])
 
     def test_non_numeric_settings_use_defaults(self):
         self.plugin.config.update(echo_message_count="invalid", echo_threshold=None)

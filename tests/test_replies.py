@@ -84,7 +84,7 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.event._has_send_oper = True
         self.event.result.chain = [plugin_module.Image()]
         await self.plugin.mark_reply_sent(self.event)
-        self.assertEqual(self.chat.messages[-1]["text"], "[图片]")
+        self.assertEqual(self.chat.messages[-1]["text"], "[图片，内容未读取]")
         self.assertEqual(list(self.chat.reply_ts), [1000.0])
 
     async def test_pending_reply_prevents_overbooking_and_failed_callback_releases_it(self):

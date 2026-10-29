@@ -88,7 +88,7 @@ def _load_plugin():
         modules[name] = ModuleType(name)
         modules[name].__dict__.update(attributes)
     path = Path(__file__).resolve().parents[1] / "main.py"
-    spec = importlib.util.spec_from_file_location("oncue_timing_tests", path)
+    spec = importlib.util.spec_from_file_location("oncue_timing_tests", path, submodule_search_locations=[str(path.parent)])
     module = importlib.util.module_from_spec(spec)
     modules[spec.name] = module
     with patch.dict(sys.modules, modules):

@@ -4,7 +4,7 @@ import random
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -16,8 +16,10 @@ from astrbot.api.star import Context, Star, StarTools
 from astrbot.core.message.components import At, Image, Plain, Reply
 from astrbot.core.message.message_event_result import ResultContentType
 
+from .message_context import ImageReference, MessagePart, render_message
 
-MESSAGE_CACHE_LIMIT = 50
+
+MESSAGE_CACHE_LIMIT = 300
 QUOTE_PREVIEW_LIMIT = 300
 
 
@@ -117,8 +119,24 @@ class OnCuePlugin(Star):
 
     def _chat(self, chat_id: str) -> ChatFacts:
         if chat_id not in self.chats:
-            self.chats[chat_id] = ChatFacts()
+            self.chats[chat_id] = ChatFacts(messages=deque(maxlen=self._message_cache_count()))
         return self.chats[chat_id]
+
+    def _message_cache_count(self) -> int:
+        return max(2, self._cfg_int("message_cache_count", MESSAGE_CACHE_LIMIT))
+
+    def _resize_message_cache(self, chat: ChatFacts) -> None:
+        capacity = self._message_cache_count()
+        if chat.messages.maxlen != capacity:
+            chat.messages = deque(chat.messages, maxlen=capacity)
+
+    def _append_message(self, chat: ChatFacts, item: dict) -> bool:
+        """持有会话锁时入账；重复投递不更新任何触发状态。"""
+        self._resize_message_cache(chat)
+        if any(m.get("record_id") == item["record_id"] for m in chat.messages):
+            return False
+        chat.messages.append(item)
+        return True
 
     def _cfg_value(self, key: str, default):
         try:
@@ -127,7 +145,7 @@ class OnCuePlugin(Star):
             value = None
         if value is not None:
             return value
-        for section in ("config_wake", "config_decision", "config_trigger", "config_character"):
+        for section in ("config_wake", "config_decision", "config_trigger", "config_character", "config_context"):
             try:
                 obj = self.config.get(section, {})
             except Exception:
@@ -375,88 +393,121 @@ class OnCuePlugin(Star):
         target = self._participant_label(target_id, getattr(comp, "name", ""), self_id)
         return f"[提及 {target}]"
 
-    def _quote_content(self, comp: Reply, self_id: str) -> str:
+    def _mention_part(self, comp: At, self_id: str) -> MessagePart:
+        return MessagePart(
+            "mention", self._mention_text(comp, self_id),
+            reference_id=str(getattr(comp, "qq", "") or ""),
+        )
+
+    @staticmethod
+    def _platform_message_id(value) -> str:
+        message_id = "" if value is None else str(value).strip()
+        # AstrBot 的部分适配器用 unknown 表示缺失 ID，不能用于去重或引用恢复。
+        return "" if message_id == "unknown" else message_id
+
+    @staticmethod
+    def _image_part(comp: Image, image_id: str) -> MessagePart:
+        # 平台提供的默认资源引用；本组只登记，不下载、不判断远端状态。
+        source = getattr(comp, "url", None) or getattr(comp, "file", None) or getattr(comp, "path", None)
+        return MessagePart("image", image=ImageReference(image_id, str(source or "")))
+
+    def _quote_parts(self, comp: Reply, self_id: str, record_id: str) -> tuple[MessagePart, ...]:
         parts = []
-        for quoted in getattr(comp, "chain", None) or []:
+        for index, quoted in enumerate(getattr(comp, "chain", None) or []):
             if isinstance(quoted, Plain):
-                parts.append(quoted.text or "")
+                parts.append(MessagePart("text", quoted.text or ""))
             elif isinstance(quoted, Image):
-                parts.append("[图片]")
+                parts.append(self._image_part(quoted, f"{record_id}:quoted:{index}"))
             elif isinstance(quoted, At):
-                parts.append(self._mention_text(quoted, self_id))
+                parts.append(self._mention_part(quoted, self_id))
             elif isinstance(quoted, Reply):
                 # 引文只展开一层，避免嵌套引用不断放大上下文。
-                parts.append("[嵌套引用]")
+                parts.append(MessagePart("quote", "[嵌套引用]"))
             else:
-                parts.append("[附件]")
-        return " ".join(parts).strip() or str(
-            getattr(comp, "message_str", "") or getattr(comp, "text", "") or ""
-        ).strip()
+                parts.append(MessagePart("attachment", "[附件]"))
+        if not render_message(tuple(parts)):
+            fallback = str(getattr(comp, "message_str", "") or getattr(comp, "text", "") or "").strip()
+            parts = [MessagePart("text", fallback)] if fallback else []
+        return tuple(parts)
 
-    def _reply_text(self, comp: Reply, self_id: str, chat: ChatFacts | None) -> str:
-        message_id = str(getattr(comp, "id", "") or "").strip()
+    def _reply_part(self, comp: Reply, self_id: str, chat: ChatFacts | None, record_id: str) -> MessagePart:
+        message_id = self._platform_message_id(getattr(comp, "id", None))
         sender_id = str(getattr(comp, "sender_id", "") or "").strip()
         if sender_id in {"0", "unknown"}:
             sender_id = ""
         sender_name = getattr(comp, "sender_nickname", "") or ""
-        content = self._quote_content(comp, self_id)
+        children = self._quote_parts(comp, self_id, record_id)
+        content = render_message(children)
         # 只用同一会话中 ID 精确匹配的原消息补齐，不能按昵称或相邻位置猜测。
         if chat is not None and message_id:
             source = next((m for m in reversed(chat.messages) if m.get("message_id") == message_id), None)
             if source is not None:
                 sender_id = sender_id or source["sender_id"]
                 sender_name = sender_name or source["sender_name"]
-                content = content or source["text"]
+                if not content:
+                    # 缓存回填也只展开一层，不能沿连续引用持有已淘汰的整棵消息树。
+                    children = tuple(
+                        MessagePart("quote", "[嵌套引用]") if p.kind == "quote" else p
+                        for p in source["parts"]
+                    )
         author = self._participant_label(sender_id, sender_name, self_id)
-        preview = re.sub(r"\s+", " ", content).strip()
-        if len(preview) > QUOTE_PREVIEW_LIMIT:
-            preview = preview[:QUOTE_PREVIEW_LIMIT] + "…"
+        preview = render_message(
+            tuple(replace(p, text=re.sub(r"\s+", " ", p.text).strip()) for p in children),
+            QUOTE_PREVIEW_LIMIT,
+        )
         reference = f"消息ID={json.dumps(message_id, ensure_ascii=False)}" if message_id else "消息ID未知"
         excerpt = f"摘录={json.dumps(preview, ensure_ascii=False)}" if preview else "原文未知"
-        return f"[引用 {reference}；作者={author}；{excerpt}]"
+        return MessagePart(
+            "quote", f"[引用 {reference}；作者={author}；{excerpt}]",
+            reference_id=message_id, sender_id=sender_id, sender_name=str(sender_name), children=children,
+        )
 
     def _event_to_item(self, event: AstrMessageEvent, chat: ChatFacts | None = None) -> dict:
         parts = []
         pure_text_parts = []
-        image_count = 0
-        other_count = 0
+        obj = getattr(event, "message_obj", None)
+        message_id = self._platform_message_id(getattr(obj, "message_id", None))
+        record_id = event.get_extra("oncue_record_id")
+        if not record_id:
+            record_id = f"platform:{message_id}" if message_id else "internal:" + uuid4().hex
+            event.set_extra("oncue_record_id", record_id)
         only_plain = True
         self_id = str(event.get_self_id())
-        for comp in event.get_messages():
+        for index, comp in enumerate(event.get_messages()):
             if not isinstance(comp, Plain):
                 only_plain = False
             if isinstance(comp, Plain):
                 text = (comp.text or "").strip()
                 if text:
-                    parts.append(text)
+                    parts.append(MessagePart("text", text))
                     pure_text_parts.append(text)
             elif isinstance(comp, Image):
-                image_count += 1
+                parts.append(self._image_part(comp, f"{record_id}:{index}"))
             elif isinstance(comp, At):
-                parts.append(self._mention_text(comp, self_id))
+                parts.append(self._mention_part(comp, self_id))
             elif isinstance(comp, Reply):
-                parts.append(self._reply_text(comp, self_id, chat))
+                parts.append(self._reply_part(comp, self_id, chat, f"{record_id}:{index}"))
             else:
-                other_count += 1
-        text = " ".join(parts).strip()
+                parts.append(MessagePart("attachment", "[附件]"))
+        parts = tuple(parts)
+        text = render_message(parts)
         pure_text = " ".join(pure_text_parts).strip()
-        if image_count:
-            text = (text + " " if text else "") + " ".join(["[图片]"] * image_count)
-        if other_count:
-            text = (text + " " if text else "") + " ".join(["[附件]"] * other_count)
         sender = getattr(getattr(event, "message_obj", None), "sender", None)
         sender_name = getattr(sender, "nickname", "") or str(event.get_sender_id())
+        now = time.time()
         return {
-            "message_id": str(getattr(getattr(event, "message_obj", None), "message_id", "") or ""),
-            "ts": time.time(),
-            "time_str": datetime.now().strftime("%H:%M:%S"),
+            "message_id": message_id,
+            "record_id": record_id,
+            "parts": parts,
+            "ts": now,
+            "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S"),
             "sender_id": str(event.get_sender_id()),
             "sender_name": str(sender_name),
             "role": "user",
             "text": text or "[空消息]",
             "pure_text": pure_text,
             "is_pure_text": only_plain and bool(pure_text),
-            "active": bool(text or image_count or other_count),
+            "active": bool(text),
         }
 
     def _wake_names(self) -> list[str]:
@@ -519,7 +570,9 @@ class OnCuePlugin(Star):
             chat.backoffs.pop(key, None)
 
     def _history_text(self, chat: ChatFacts) -> str:
-        count = max(1, self._cfg_int("context_message_count", 20))
+        self._resize_message_cache(chat)
+        count = max(1, self._cfg_int("context_message_count", 50))
+        limit = max(1, self._cfg_int("message_char_limit", 500))
         rows = list(chat.messages)[-count:]
         if not rows:
             return ""
@@ -527,18 +580,23 @@ class OnCuePlugin(Star):
         for m in rows:
             sender = "Bot（你）" if m.get("role") == "assistant" else self._participant_label(m["sender_id"], m["sender_name"])
             message_id = m.get("message_id", "")
-            reference = f" / 消息ID={json.dumps(message_id, ensure_ascii=False)}" if message_id else ""
-            lines.append(f"[{sender} / {m['time_str']}{reference}]: {m['text']}")
+            label = "消息ID" if message_id else "内部ID"
+            reference = f" / {label}={json.dumps(message_id or m['record_id'], ensure_ascii=False)}"
+            text = render_message(m["parts"], limit) or "[空消息]"
+            lines.append(f"[{sender} / {m['time_str']}{reference}]: {text}")
         return (
             "群聊记录按顺序逐条列出；引用摘录是旧消息，不是当前发言。"
             "请结合提及和引用区分对话对象，面向其他成员的话不等于向你提问；连续消息可能属于不同话题。\n"
             + "\n".join(lines)
         )
 
-    def _record_reply(self, chat: ChatFacts, text: str, now: float) -> None:
+    def _record_reply(self, chat: ChatFacts, text: str, now: float, parts: tuple[MessagePart, ...] | None = None) -> None:
         """在持有会话锁时记录发送结果；自身发言只供决策参考。"""
         self._cancel_message_wait(chat)
-        chat.messages.append({
+        self._append_message(chat, {
+            "message_id": "",
+            "record_id": "internal:" + uuid4().hex,
+            "parts": parts if parts is not None else (MessagePart("text", text),),
             "ts": now,
             "time_str": datetime.fromtimestamp(now).strftime("%H:%M:%S"),
             "sender_id": "assistant",
@@ -751,7 +809,7 @@ class OnCuePlugin(Star):
 
     def _stat_trigger_locked(self, chat: ChatFacts, item: dict, now: float) -> tuple[str, str] | None:
         if self._cfg_bool("enable_echo_trigger", False) and item.get("is_pure_text", False):
-            window = max(2, min(self._cfg_int("echo_message_count", 5), MESSAGE_CACHE_LIMIT))
+            window = max(2, min(self._cfg_int("echo_message_count", 5), chat.messages.maxlen))
             threshold = max(2, min(self._cfg_int("echo_threshold", 3), window))
             norm = re.sub(r"\s+", " ", item["pure_text"]).strip()
             if norm:
@@ -766,9 +824,12 @@ class OnCuePlugin(Star):
                 key = f"echo:{norm}"
                 if count >= threshold and self._trigger_ready(chat, key, now):
                     logger.info(f"[OnCue] 触发边命中: echo | 最近 {len(recent)} 条 | 人数 {count}/{threshold} | {norm[:40]}")
+                    preview = render_message(
+                        (MessagePart("text", norm),), max(1, self._cfg_int("message_char_limit", 500)),
+                    )
                     return (
                         f"最近 {len(recent)} 条群聊消息中，有 {count} 名不同成员重复了同一句纯文本："
-                        f"{json.dumps(norm, ensure_ascii=False)}。请结合角色性格和聊天语境，判断是否想参与。",
+                        f"{json.dumps(preview, ensure_ascii=False)}。请结合角色性格和聊天语境，判断是否想参与。",
                         key,
                     )
         if self._cfg_bool("enable_dense_trigger", False):
@@ -796,7 +857,9 @@ class OnCuePlugin(Star):
             now = time.time()
             observing = self._is_observing(chat, now)
             item = self._event_to_item(event, chat)
-            chat.messages.append(item)
+            if not self._append_message(chat, item):
+                event.stop_event()
+                return
             if self._cfg_bool("enable_glance", False):
                 # 仅保存路由信息，不持有入站事件、原消息或媒体临时文件。
                 chat.glance_target = {
@@ -917,18 +980,29 @@ class OnCuePlugin(Star):
             if not getattr(event, "_has_send_oper", False) or not result:
                 return
             parts = []
+            has_body = False
             for comp in result.chain or []:
                 if isinstance(comp, Plain):
                     if (comp.text or "").strip():
-                        parts.append(comp.text.strip())
+                        parts.append(MessagePart("text", comp.text.strip()))
+                        has_body = True
                 elif isinstance(comp, Image):
-                    parts.append("[图片]")
-                elif not isinstance(comp, (At, Reply)):
-                    parts.append("[附件]")
-            text = " ".join(parts)
+                    parts.append(self._image_part(comp, "internal:" + uuid4().hex))
+                    has_body = True
+                elif isinstance(comp, At):
+                    parts.append(self._mention_part(comp, str(event.get_self_id())))
+                elif isinstance(comp, Reply):
+                    parts.append(self._reply_part(comp, str(event.get_self_id()), chat, "internal:" + uuid4().hex))
+                else:
+                    parts.append(MessagePart("attachment", "[附件]"))
+                    has_body = True
+            if not has_body:
+                return
+            parts = tuple(parts)
+            text = render_message(parts)
             if not text:
                 return
             now = time.time()
-            self._record_reply(chat, text, now)
+            self._record_reply(chat, text, now, parts)
             self._trigger_success(chat, decision.get("_backoff_key"))
             logger.info(f"[OnCue] 回复已发送: 进入观测 {self._cfg_int('observation_timeout', 120)}s | 冷却 {self._cfg_int('reply_cooldown', 10)}s")

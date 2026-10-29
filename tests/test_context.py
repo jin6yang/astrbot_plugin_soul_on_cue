@@ -90,7 +90,7 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
             "m1", sender_id="bob", message_str="不完整的纯文本",
             chain=[at("bot"), Plain("看看这张图"), plugin_module.Image(), object()],
         )))
-        self.assertIn("[提及 Bot（你）] 看看这张图 [图片] [附件]", item["text"])
+        self.assertIn("[提及 Bot（你）] 看看这张图 [图片，内容未读取] [附件]", item["text"])
         self.assertNotIn("不完整的纯文本", item["text"])
         self.assertEqual(item["pure_text"], "")
         self.assertTrue(item["active"])
@@ -159,7 +159,7 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
     def test_quote_preview_is_bounded_and_distinguishes_multiline_content(self):
         item = self.cache(self.event(reply("m1", message_str="甲\n乙\t" + "长" * 400)))
         self.assertIn("甲 乙 ", item["text"])
-        self.assertIn("…", item["text"])
+        self.assertIn("中间省略", item["text"])
         self.assertNotIn("长" * 301, item["text"])
         self.assertNotIn("\n", item["text"])
 

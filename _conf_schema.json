@@ -3,7 +3,7 @@
     "description": "启用决策层",
     "type": "bool",
     "default": true,
-    "hint": "此为必须项"
+    "hint": "此为必须项。⚠️ 启用本插件需要关闭 AstrBot 原生「主动回复」功能"
   },
   "config_wake": {
     "description": "🔔 观测与唤醒",
@@ -45,11 +45,6 @@
         "default": "",
         "_special": "select_provider",
         "hint": "建议轻量快速模型；留空用当前对话模型"
-      },
-      "context_message_count": {
-        "description": "决策参考消息数",
-        "type": "int",
-        "default": 20
       },
       "message_wait_seconds": {
         "description": "单次消息等待时间（秒）",
@@ -112,7 +107,7 @@
         "description": "检测最近消息的数量",
         "type": "int",
         "default": 5,
-        "hint": "检测最近多少条缓存消息中是否包含复读的情况当前消息。范围 2–50"
+        "hint": "检测最近多少条消息；最少 2 条，不超过消息缓存容量"
       },
       "enable_dense_trigger": {
         "description": "启用密集发言参与",
@@ -157,6 +152,30 @@
         "description": "一瞥最大间隔（分）",
         "type": "int",
         "default": 35
+      }
+    }
+  },
+  "config_context": {
+    "description": "🧾 群聊上下文",
+    "type": "object",
+    "items": {
+      "message_cache_count": {
+        "description": "每会话缓存消息数",
+        "type": "int",
+        "default": 300,
+        "hint": "最少 2 条；保留最近的消息，不会全部注入模型"
+      },
+      "context_message_count": {
+        "description": "单次参考消息数",
+        "type": "int",
+        "default": 50,
+        "hint": "从缓存中取最近的消息，供决策和回复参考"
+      },
+      "message_char_limit": {
+        "description": "单条消息字符上限",
+        "type": "int",
+        "default": 500,
+        "hint": "含图片标记和转述；过长保留首尾，截断说明另计"
       }
     }
   },
