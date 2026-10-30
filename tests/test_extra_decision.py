@@ -177,7 +177,6 @@ class ExtraDecisionTests(unittest.IsolatedAsyncioTestCase):
         await self.receive(self.message("", "empty"))
         await self.receive(self.message("own message", "self", sender_id="bot"))
         recorded_image = next(part.image for part in self.chat.messages[0]["parts"] if part.image)
-        recorded_image.status = "已转述"
         recorded_image.description = "later description"
         self.assertEqual(self.chat.incoming_seq, initial_progress)
         release[0].set()

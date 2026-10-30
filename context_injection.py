@@ -10,7 +10,7 @@ def request_background(
     if not include_history:
         if target is None:
             return ""
-        snapshot = ContextSnapshot((target,), snapshot.progress)
+        snapshot = ContextSnapshot((target,), snapshot.progress, snapshot.image_note)
     bodies = {}
     if (req.prompt and req.prompt.strip()) or getattr(req, "image_urls", None) or getattr(req, "audio_urls", None):
         current_id = event.get_extra("oncue_record_id")

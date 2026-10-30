@@ -212,8 +212,8 @@ class MessageRecordTests(unittest.IsolatedAsyncioTestCase):
         self.cache(self.event(reply("one"), Plain("中间的回应"), message_id="two"))
         item = self.cache(self.event(reply("two"), Plain("最新回应"), message_id="three"))
         quote = item["parts"][0]
-        self.assertIn("中间的回应", quote.text)
-        self.assertNotIn("最初的内容", quote.text)
+        self.assertIn("中间的回应", quote.render())
+        self.assertNotIn("最初的内容", quote.render())
         self.assertEqual(quote.children[0].text, "[嵌套引用]")
         self.assertFalse(quote.children[0].children)
 
@@ -251,7 +251,6 @@ class MessageRecordTests(unittest.IsolatedAsyncioTestCase):
     def test_multiple_image_descriptions_share_one_message_budget(self):
         item = self.cache(self.event(self.image(), self.image()))
         first, second = (part.image for part in item["parts"])
-        first.status = second.status = "已转述"
         first.description = "甲" * 350
         second.description = "乙" * 350
         history = self.plugin._history_text(self.chat)

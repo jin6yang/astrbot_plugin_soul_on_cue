@@ -4,7 +4,7 @@ import random
 import re
 import time
 from collections import deque
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from uuid import uuid4
@@ -18,11 +18,11 @@ from astrbot.core.message.components import At, Image, Plain, Reply
 from astrbot.core.message.message_event_result import ResultContentType
 
 from .context_injection import add_stage_direction, request_background, set_temporary_background
-from .message_context import ContextRow, ContextSnapshot, ImageReference, MessagePart, render_message
+from .image_cache import CacheLimits, SessionImageCache
+from .message_context import ContextRow, ContextSnapshot, ImageReference, MessagePart, iter_image_parts, iter_images, render_message
 
 
 MESSAGE_CACHE_LIMIT = 300
-QUOTE_PREVIEW_LIMIT = 300
 
 
 DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请代入以下角色，判断看到群聊对话后是否想开口。
@@ -97,23 +97,36 @@ class OnCuePlugin(Star):
         self.kb_not_taken_warned = False
         self._terminating = False
         self._context_conflict_signatures: dict[str, tuple[str, ...]] = {}
+        self.image_cache: SessionImageCache | None = None
+        self.image_cache_task: asyncio.Task | None = None
 
     async def initialize(self) -> None:
         try:
             self.data_dir = StarTools.get_data_dir("astrbot_plugin_soul_on_cue")
+            self.image_cache = SessionImageCache(
+                self.data_dir / "images", limits=self._image_cache_limits, logger=logger,
+            )
+            self.image_cache_task = asyncio.create_task(self._image_cleanup_loop())
             self.glance_file = self.data_dir / "glance.json"
             self._load_glance()
             if self._cfg_bool("enable", True):
                 await self._decision_card()
             self.glance_task = asyncio.create_task(self._glance_loop())
         except Exception as e:
-            logger.error(f"[OnCue] 初始化 GLANCE 失败: {e}")
+            logger.error(f"[OnCue] 初始化失败: {e}")
 
     async def terminate(self) -> None:
         self._terminating = True
         for chat in list(self.chats.values()):
             async with chat.lock:
                 self._cancel_message_wait(chat)
+        if self.image_cache_task:
+            self.image_cache_task.cancel()
+            try:
+                await self.image_cache_task
+            except asyncio.CancelledError:
+                pass
+            self.image_cache_task = None
         if self.glance_task:
             self.glance_task.cancel()
             try:
@@ -121,6 +134,33 @@ class OnCuePlugin(Star):
             except asyncio.CancelledError:
                 pass
             self.glance_task = None
+        if self.image_cache:
+            await self.image_cache.close()
+            self.image_cache = None
+
+    def _image_cache_limits(self) -> CacheLimits:
+        return CacheLimits(
+            max_image_bytes=max(1, self._cfg_int("image_max_mb", 30)) * 1024**2,
+            max_count=max(1, self._cfg_int("image_cache_count", 20)),
+            max_total_bytes=max(1, self._cfg_int("image_cache_mb", 75)) * 1024**2,
+            ttl_seconds=max(1, self._cfg_int("image_cache_minutes", 120)) * 60,
+        )
+
+    async def _image_cleanup_loop(self) -> None:
+        while True:
+            await asyncio.sleep(15)
+            if self.image_cache:
+                self.image_cache.cleanup()
+
+    async def _retain_local_images(self, chat_id: str, parts: tuple[MessagePart, ...]) -> None:
+        cache = self.image_cache
+        if cache is None:
+            return
+        seen = set()
+        for image in iter_images(parts):
+            if image.local_source and image.image_id not in seen:
+                seen.add(image.image_id)
+                await cache.ensure(chat_id, image, source=image.local_source)
 
     def _chat(self, chat_id: str) -> ChatFacts:
         if chat_id not in self.chats:
@@ -445,9 +485,21 @@ class OnCuePlugin(Star):
 
     @staticmethod
     def _image_part(comp: Image, image_id: str) -> MessagePart:
-        # 平台提供的默认资源引用；本组只登记，不下载、不判断远端状态。
-        source = getattr(comp, "url", None) or getattr(comp, "file", None) or getattr(comp, "path", None)
-        return MessagePart("image", image=ImageReference(image_id, str(source or "")))
+        sources = [getattr(comp, name, None) for name in ("url", "file", "path")]
+        sources = [source for source in sources if isinstance(source, str) and source]
+        local = ""
+        for source in sources:
+            if source.startswith(("http://", "https://", "base64://", "data:")):
+                continue
+            try:
+                if source.startswith("file://") or Path(source).is_file():
+                    local = source
+                    break
+            except (OSError, ValueError):
+                pass
+        return MessagePart("image", image=ImageReference(
+            image_id, sources[0] if sources else "", local_source=local,
+        ))
 
     def _quote_parts(self, comp: Reply, self_id: str, record_id: str) -> tuple[MessagePart, ...]:
         parts = []
@@ -488,16 +540,19 @@ class OnCuePlugin(Star):
                         MessagePart("quote", "[嵌套引用]") if p.kind == "quote" else p
                         for p in source["parts"]
                     )
+                else:
+                    # 已明确引用同一条原消息，且资源唯一匹配时复用逐图身份。
+                    originals = [p.image for p in source["parts"] if p.image is not None]
+                    for quoted in iter_image_parts(children):
+                        matches = [image for image in originals if image.source and image.source == quoted.image.source]
+                        if len(matches) == 1:
+                            quoted.image = matches[0]
         author = self._participant_label(sender_id, sender_name, self_id)
-        preview = render_message(
-            tuple(replace(p, text=re.sub(r"\s+", " ", p.text).strip()) for p in children),
-            QUOTE_PREVIEW_LIMIT,
-        )
         reference = f"消息ID={json.dumps(message_id, ensure_ascii=False)}" if message_id else "消息ID未知"
-        excerpt = f"摘录={json.dumps(preview, ensure_ascii=False)}" if preview else "原文未知"
         return MessagePart(
-            "quote", f"[引用 {reference}；作者={author}；{excerpt}]",
+            "quote",
             reference_id=message_id, sender_id=sender_id, sender_name=str(sender_name), children=children,
+            quote_prefix=f"[引用 {reference}；作者={author}；",
         )
 
     def _event_to_item(self, event: AstrMessageEvent, chat: ChatFacts | None = None) -> dict:
@@ -528,6 +583,9 @@ class OnCuePlugin(Star):
             else:
                 parts.append(MessagePart("attachment", "[附件]"))
         parts = tuple(parts)
+        if self.image_cache:
+            for part in iter_image_parts(parts):
+                part.image = self.image_cache.register(event.unified_msg_origin, part.image)
         text = render_message(parts)
         pure_text = " ".join(pure_text_parts).strip()
         sender = getattr(getattr(event, "message_obj", None), "sender", None)
@@ -608,6 +666,8 @@ class OnCuePlugin(Star):
             chat.backoffs.pop(key, None)
 
     def _context_snapshot(self, chat: ChatFacts, self_id: str = "") -> ContextSnapshot:
+        if self.image_cache:
+            self.image_cache.cleanup()
         self._resize_message_cache(chat)
         count = max(1, self._cfg_int("context_message_count", 50))
         limit = max(1, self._cfg_int("message_char_limit", 500))
@@ -631,7 +691,15 @@ class OnCuePlugin(Star):
                 m["record_id"], message_id, m["role"], f"[{sender} / {m['time_str']}{reference}]", text,
                 render_message(tuple(relations), limit),
             ))
-        return ContextSnapshot(tuple(records), chat.incoming_seq)
+        has_images = any(any(iter_images(m["parts"])) for m in rows)
+        note = ""
+        if has_images:
+            max_mb = self._image_cache_limits().max_image_bytes / 1024**2
+            note = (
+                f"每张图片 {max_mb:g} MiB 是插件的大小限制，不是平台限制；"
+                "图片状态是本次快照，并非永久状态。已有描述来自模型，不等于完整原图或确定事实。"
+            )
+        return ContextSnapshot(tuple(records), chat.incoming_seq, note)
 
     def _history_text(self, chat: ChatFacts) -> str:
         return self._context_snapshot(chat).render()
@@ -958,6 +1026,40 @@ class OnCuePlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.GROUP_MESSAGE, priority=-10)
     async def on_message(self, event: AstrMessageEvent):
+        if self.image_cache:
+            self.image_cache.cleanup()
+        await self._on_group_message(event)
+        if self.image_cache and not self._terminating and self._cfg_bool("enable", True):
+            chat = self.chats.get(event.unified_msg_origin)
+            record_id = event.get_extra("oncue_record_id")
+            if chat is not None and record_id:
+                item = next((m for m in chat.messages if m["record_id"] == record_id), None)
+                if item is not None:
+                    # 在入站事件资源被框架清理前复制，仅保留已有本地资源。
+                    try:
+                        await self._retain_local_images(event.unified_msg_origin, item["parts"])
+                        async with chat.lock:
+                            decision = event.get_extra("oncue_decision")
+                            if isinstance(decision, dict) and (
+                                self._terminating or not self._cfg_bool("enable", True)
+                                or ("_reply_version" in decision and decision["_reply_version"] != chat.reply_version)
+                            ):
+                                self._discard_decision(event, chat)
+                    except BaseException:
+                        async with chat.lock:
+                            self._discard_decision(event, chat)
+                        raise
+
+    @staticmethod
+    def _discard_decision(event: AstrMessageEvent, chat: ChatFacts) -> None:
+        """持有会话锁时释放本事件名额，不影响新事件的占用。"""
+        decision = event.get_extra("oncue_decision")
+        if isinstance(decision, dict):
+            chat.pending_replies.pop(decision.get("_reservation"), None)
+            event.set_extra("oncue_decision", None)
+            event.is_at_or_wake_command = False
+
+    async def _on_group_message(self, event: AstrMessageEvent):
         if self._terminating or not self._cfg_bool("enable", True):
             return
         if str(event.get_sender_id()) == str(event.get_self_id()):
@@ -995,6 +1097,7 @@ class OnCuePlugin(Star):
                 if self._cfg_bool("force_reply_when_summoned", True):
                     event.set_extra("oncue_decision", {
                         "should_reply": True, "speaker": "", "mood": "", "reason": "被@/点名直接回复",
+                        "_reply_version": chat.reply_version,
                         "_chat_context": self._context_snapshot(chat, str(event.get_self_id())),
                     })
                     event.is_at_or_wake_command = True
@@ -1119,3 +1222,7 @@ class OnCuePlugin(Star):
             self._record_reply(chat, text, now, parts)
             self._trigger_success(chat, decision.get("_backoff_key"))
             logger.info(f"[OnCue] 回复已发送: 进入观测 {self._cfg_int('observation_timeout', 120)}s | 冷却 {self._cfg_int('reply_cooldown', 10)}s")
+        if self.image_cache and not self._terminating:
+            for part in iter_image_parts(parts):
+                part.image = self.image_cache.register(event.unified_msg_origin, part.image)
+            await self._retain_local_images(event.unified_msg_origin, parts)

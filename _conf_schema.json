@@ -188,6 +188,30 @@
         "type": "int",
         "default": 500,
         "hint": "含图片标记和转述；过长保留首尾，截断说明另计"
+      },
+      "image_max_mb": {
+        "description": "单张图片上限（MiB）",
+        "type": "int",
+        "default": 30,
+        "hint": "插件缓存的单张资源上限，最少 1 MiB"
+      },
+      "image_cache_count": {
+        "description": "每会话最多缓存图片数",
+        "type": "int",
+        "default": 20,
+        "hint": "最少 1 张；保留最新缓存，读取不续期"
+      },
+      "image_cache_mb": {
+        "description": "每会话图片缓存上限（MiB）",
+        "type": "int",
+        "default": 75,
+        "hint": "最少 1 MiB；各会话独立计算"
+      },
+      "image_cache_minutes": {
+        "description": "图片强制清理时间（分）",
+        "type": "int",
+        "default": 120,
+        "hint": "从成功缓存起计时；新转述完成后，剩余时间仅保留 30%"
       }
     }
   },

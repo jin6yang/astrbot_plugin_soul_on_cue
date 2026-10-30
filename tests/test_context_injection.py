@@ -265,7 +265,6 @@ class ContextInjectionTests(unittest.IsolatedAsyncioTestCase):
         event, snapshot = self.approve()
         frozen = snapshot.render()
         item["parts"][1].image.description = "后来才完成的描述"
-        item["parts"][1].image.status = "已转述"
         self.cache("决策之后的新消息", message_id="later")
         req = self.request()
         await self.plugin.inject_stage_direction(event, req)
