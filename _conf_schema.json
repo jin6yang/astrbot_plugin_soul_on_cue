@@ -82,7 +82,7 @@
       "decision_prompt": {
         "description": "决策提示词（高级）",
         "type": "text",
-        "default": "你是群聊角色扮演机器人的\"内心\"。请代入以下角色，判断看到群聊对话后是否想开口。\n\n<角色设定>\n{character_card}\n</角色设定>\n\n当前时间：{current_time}\n\n<触发背景>\n{entry_context}\n</触发背景>\n\n<群聊近况>\n{chat_history}\n</群聊近况>\n\n判断原则（按优先级）：\n1. 有人明确@或点名你、或直接向你提问 → 优先考虑回应，仍可根据角色和语境保持沉默\n2. 话题命中角色的兴趣或专业领域、有人需要帮助、气氛需要打圆场 → 可以开口\n3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静\n4. 只有 [图片]/表情包且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静（[图片] 只代表群里有人活动，不是开口理由）\n5. 有任何犹豫 → 保持安静\n\n只输出 JSON，不要输出其它内容：\n{\"should_reply\": true或false, \"speaker\": \"回应的角色名(单角色填角色名)\", \"mood\": \"当前心情短语\", \"reason\": \"一句话理由\"}",
+        "default": "你是群聊角色扮演机器人的\"内心\"。请代入以下角色，判断看到群聊对话后是否想开口。\n\n判断原则（按优先级）：\n1. 有人明确@或点名你、或直接向你提问 → 优先考虑回应，仍可根据角色和语境保持沉默\n2. 话题命中角色的兴趣或专业领域、有人需要帮助、气氛需要打圆场 → 可以开口\n3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静\n4. 只有内容未读取的图片占位，且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静；已提供图片或描述时，结合实际内容判断\n5. 有任何犹豫 → 保持安静\n6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空\n\n只输出 JSON，不要输出其它内容：\n{\"should_reply\": true或false, \"speaker\": \"回应的角色名(单角色填角色名)\", \"mood\": \"当前心情短语\", \"reason\": \"一句话理由\", \"need_kb\": true或false, \"kb_query\": \"需要时填独立检索词\"}\n\n<角色设定>\n{character_card}\n</角色设定>\n\n<群聊近况>\n{chat_history}\n</群聊近况>\n\n当前时间：{current_time}\n\n<触发背景>\n{entry_context}\n</触发背景>",
         "hint": "可用变量: {character_card} {current_time} {entry_context} {chat_history}"
       }
     }
@@ -159,6 +159,12 @@
     "description": "🧾 群聊上下文",
     "type": "object",
     "items": {
+      "enable_context_injection": {
+        "description": "整理群聊上下文",
+        "type": "bool",
+        "default": true,
+        "hint": "此为建议项。不可与 AstrBot 的「群聊消息记录注入上下文」同时启用以避免重复注入等问题。"
+      },
       "message_cache_count": {
         "description": "每会话缓存消息数",
         "type": "int",

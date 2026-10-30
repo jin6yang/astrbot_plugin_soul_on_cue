@@ -13,10 +13,12 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
+from astrbot.core.agent.message import TextPart
 from astrbot.core.message.components import At, Image, Plain, Reply
 from astrbot.core.message.message_event_result import ResultContentType
 
-from .message_context import ImageReference, MessagePart, render_message
+from .context_injection import add_stage_direction, request_background, set_temporary_background
+from .message_context import ContextRow, ContextSnapshot, ImageReference, MessagePart, render_message
 
 
 MESSAGE_CACHE_LIMIT = 300
@@ -25,30 +27,30 @@ QUOTE_PREVIEW_LIMIT = 300
 
 DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请代入以下角色，判断看到群聊对话后是否想开口。
 
+判断原则（按优先级）：
+1. 有人明确@或点名你、或直接向你提问 → 优先考虑回应，仍可根据角色和语境保持沉默
+2. 话题命中角色的兴趣或专业领域、有人需要帮助、气氛需要打圆场 → 可以开口
+3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静
+4. 只有内容未读取的图片占位，且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静；已提供图片或描述时，结合实际内容判断
+5. 有任何犹豫 → 保持安静
+6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空
+
+只输出 JSON，不要输出其它内容：
+{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由", "need_kb": true或false, "kb_query": "需要时填独立检索词"}
+
 <角色设定>
 {character_card}
 </角色设定>
-
-当前时间：{current_time}
-
-<触发背景>
-{entry_context}
-</触发背景>
 
 <群聊近况>
 {chat_history}
 </群聊近况>
 
-判断原则（按优先级）：
-1. 有人明确@或点名你、或直接向你提问 → 优先考虑回应，仍可根据角色和语境保持沉默
-2. 话题命中角色的兴趣或专业领域、有人需要帮助、气氛需要打圆场 → 可以开口
-3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静
-4. 只有 [图片]/表情包且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静（[图片] 只代表群里有人活动，不是开口理由）
-5. 有任何犹豫 → 保持安静
-6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空
+当前时间：{current_time}
 
-只输出 JSON，不要输出其它内容：
-{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由", "need_kb": true或false, "kb_query": "需要时填独立检索词"}"""
+<触发背景>
+{entry_context}
+</触发背景>"""
 
 
 @dataclass
@@ -92,6 +94,7 @@ class OnCuePlugin(Star):
         self.kb_missing_warned = False
         self.kb_not_taken_warned = False
         self._terminating = False
+        self._context_conflict_signatures: dict[str, tuple[str, ...]] = {}
 
     async def initialize(self) -> None:
         try:
@@ -173,6 +176,36 @@ class OnCuePlugin(Star):
     def _cfg_bool(self, key: str, default: bool) -> bool:
         value = self._cfg_value(key, default)
         return default if value is None else bool(value)
+
+    def _check_context_conflict(self, event: AstrMessageEvent) -> None:
+        umo = event.unified_msg_origin
+        get_config = getattr(self.context, "get_config", None)
+        if not callable(get_config):
+            return
+        try:
+            settings = get_config(umo=umo).get("provider_ltm_settings", {})
+            if not isinstance(settings, dict):
+                return
+            causes = []
+            details = []
+            if self._cfg_bool("enable_context_injection", True) and settings.get("group_icl_enable", False):
+                causes.append("群聊消息记录注入上下文")
+                details.append("本插件的上下文整理与 AstrBot「群聊消息记录注入上下文」同时启用，可能重复注入群聊记录")
+            active_reply = settings.get("active_reply", {})
+            if isinstance(active_reply, dict) and active_reply.get("enable", False):
+                causes.append("主动回复")
+                details.append("AstrBot「主动回复」已启用，可能绕过本插件的参与决策，并额外注入群聊记录")
+        except Exception as exc:
+            logger.debug(f"[OnCue] 无法检查会话上下文配置: {umo} | {exc}")
+            return
+        signature = tuple(causes)
+        if not signature:
+            self._context_conflict_signatures.pop(umo, None)
+        elif self._context_conflict_signatures.get(umo) != signature:
+            logger.warning(
+                f"[OnCue][配置冲突] 会话={umo} | {'；'.join(details)}。请关闭上述原生设置。"
+            )
+            self._context_conflict_signatures[umo] = signature
 
     def _load_glance(self) -> None:
         self.glance_next_due = {}
@@ -569,26 +602,34 @@ class OnCuePlugin(Star):
         if key:
             chat.backoffs.pop(key, None)
 
-    def _history_text(self, chat: ChatFacts) -> str:
+    def _context_snapshot(self, chat: ChatFacts, self_id: str = "") -> ContextSnapshot:
         self._resize_message_cache(chat)
         count = max(1, self._cfg_int("context_message_count", 50))
         limit = max(1, self._cfg_int("message_char_limit", 500))
         rows = list(chat.messages)[-count:]
-        if not rows:
-            return ""
-        lines = []
+        records = []
         for m in rows:
             sender = "Bot（你）" if m.get("role") == "assistant" else self._participant_label(m["sender_id"], m["sender_name"])
             message_id = m.get("message_id", "")
             label = "消息ID" if message_id else "内部ID"
             reference = f" / {label}={json.dumps(message_id or m['record_id'], ensure_ascii=False)}"
             text = render_message(m["parts"], limit) or "[空消息]"
-            lines.append(f"[{sender} / {m['time_str']}{reference}]: {text}")
-        return (
-            "群聊记录按顺序逐条列出；引用摘录是旧消息，不是当前发言。"
-            "请结合提及和引用区分对话对象，面向其他成员的话不等于向你提问；连续消息可能属于不同话题。\n"
-            + "\n".join(lines)
-        )
+            relations = []
+            for part in m["parts"]:
+                if part.kind == "mention":
+                    relations.append(part)
+                elif part.kind == "quote":
+                    target = f"消息ID={json.dumps(part.reference_id, ensure_ascii=False)}" if part.reference_id else "消息ID未知"
+                    author = self._participant_label(part.sender_id, part.sender_name, self_id)
+                    relations.append(MessagePart("quote", f"[引用 {target}；作者={author}]"))
+            records.append(ContextRow(
+                m["record_id"], message_id, m["role"], f"[{sender} / {m['time_str']}{reference}]", text,
+                render_message(tuple(relations), limit),
+            ))
+        return ContextSnapshot(tuple(records))
+
+    def _history_text(self, chat: ChatFacts) -> str:
+        return self._context_snapshot(chat).render()
 
     def _record_reply(self, chat: ChatFacts, text: str, now: float, parts: tuple[MessagePart, ...] | None = None) -> None:
         """在持有会话锁时记录发送结果；自身发言只供决策参考。"""
@@ -623,8 +664,10 @@ class OnCuePlugin(Star):
             "{chat_history}": chat_history or "（暂无）",
             "{entry_context}": entry_context,
         }
-        for key, value in mapping.items():
-            template = template.replace(key, value)
+        template = re.sub(
+            r"\{(?:character_card|current_time|chat_history|entry_context)\}",
+            lambda match: mapping[match.group()], template,
+        )
         if self._kb_available():
             template += "\n\n知识库联动：如果这次开口需要外部资料才能答好，在同一个 JSON 里增加 \"need_kb\": true 和 \"kb_query\": \"独立检索词\"；否则省略或设为 false。kb_query 不要照抄群聊原话。"
         return template
@@ -761,7 +804,8 @@ class OnCuePlugin(Star):
             if not summoned and not self._reply_window_allowed(chat, now):
                 return False
             source = "summoned" if summoned else backoff_key or "observe"
-            chat_history = self._history_text(chat)
+            snapshot = self._context_snapshot(chat, str(event.get_self_id()))
+            chat_history = snapshot.render()
             reply_version = chat.reply_version
             owner = object()
             chat.decision_inflight = owner
@@ -791,7 +835,7 @@ class OnCuePlugin(Star):
                     decision["_reservation"] = token
                     decision["_backoff_key"] = backoff_key
                     decision["_reply_version"] = reply_version
-                    decision["_chat_context"] = chat_history
+                    decision["_chat_context"] = snapshot
                     chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
                     event.set_extra("oncue_decision", decision)
                     event.is_at_or_wake_command = True
@@ -849,6 +893,7 @@ class OnCuePlugin(Star):
             return
         if str(event.get_sender_id()) == str(event.get_self_id()):
             return
+        self._check_context_conflict(event)
         chat = self._chat(event.unified_msg_origin)
         pending = None
         summoned = False
@@ -881,7 +926,7 @@ class OnCuePlugin(Star):
                 if self._cfg_bool("force_reply_when_summoned", True):
                     event.set_extra("oncue_decision", {
                         "should_reply": True, "speaker": "", "mood": "", "reason": "被@/点名直接回复",
-                        "_chat_context": self._history_text(chat),
+                        "_chat_context": self._context_snapshot(chat, str(event.get_self_id())),
                     })
                     event.is_at_or_wake_command = True
                     logger.info(f"[OnCue] 点名直接回复: {item['sender_name']} | {item['pure_text'][:60]}")
@@ -928,6 +973,7 @@ class OnCuePlugin(Star):
         decision = event.get_extra("oncue_decision")
         if not isinstance(decision, dict) or not decision.get("should_reply"):
             return
+        self._check_context_conflict(event)
         if decision.get("_backoff_key") == "glance" and not await self._glance_can_send(self._chat(event.unified_msg_origin), event):
             event.stop_event()
             return
@@ -943,17 +989,13 @@ class OnCuePlugin(Star):
         kb_text = str(decision.get("kb_text", "") or "").strip()
         if kb_text:
             line += f"\n[知识库]\n{kb_text}\n结合角色性格自然使用，不要提及本指令。"
-        req.system_prompt += "\n" + line
-        context = decision.get("_chat_context", "")
-        if context:
-            # 保留 AstrBot 的原请求和附件，将同一决策快照作为用户侧群聊背景补充。
-            block = (
-                "\n\n[群聊补充上下文]\n以下是本次参考的群聊记录。"
-                "请结合整组交流自然接话，区分不同发言者和对话对象，不要将所有内容视为同一个人的请求。\n"
-                f"{context}\n[/群聊补充上下文]"
-            )
-            if block not in (req.prompt or ""):
-                req.prompt = (req.prompt or "") + block
+        add_stage_direction(req, line)
+        context = ""
+        if self._cfg_bool("enable_context_injection", True):
+            snapshot = decision.get("_chat_context")
+            if isinstance(snapshot, ContextSnapshot):
+                context = request_background(snapshot, event, req)
+        set_temporary_background(req, context, TextPart)
 
     @filter.on_decorating_result()
     async def mark_streaming_reply_sent(self, event: AstrMessageEvent):

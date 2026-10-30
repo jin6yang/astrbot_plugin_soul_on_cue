@@ -3,6 +3,39 @@
 from dataclasses import dataclass, field
 
 
+@dataclass(frozen=True)
+class ContextRow:
+    record_id: str
+    message_id: str
+    role: str
+    header: str
+    body: str
+    relations: str = ""
+
+
+@dataclass(frozen=True)
+class ContextSnapshot:
+    rows: tuple[ContextRow, ...]
+
+    def render(
+        self, *, body_overrides: dict[str, str] | None = None,
+        exclude_messages: set[tuple[str, str]] | None = None,
+    ) -> str:
+        bodies = body_overrides or {}
+        excluded = exclude_messages or set()
+        lines = [
+            f"{row.header}: {bodies.get(row.record_id, row.body)}" for row in self.rows
+            if row.record_id in bodies or not row.message_id or (row.role, row.message_id) not in excluded
+        ]
+        if not lines:
+            return ""
+        return (
+            "群聊记录按顺序逐条列出；引用摘录是旧消息，不是当前发言。"
+            "请结合提及和引用区分对话对象，面向其他成员的话不等于向你提问；连续消息可能属于不同话题。\n"
+            + "\n".join(lines)
+        )
+
+
 @dataclass
 class ImageReference:
     image_id: str

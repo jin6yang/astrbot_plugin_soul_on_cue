@@ -17,6 +17,29 @@ class Plain:
         self.text = text
 
 
+class TextPart:
+    type = "text"
+
+    def __init__(self, *, text):
+        self.text = text
+        self._no_save = False
+
+    def mark_as_temp(self):
+        self._no_save = True
+        return self
+
+
+def _request_text(req):
+    parts = [req.prompt] if req.prompt else []
+    for part in getattr(req, "extra_user_content_parts", []):
+        if isinstance(part, dict):
+            if part.get("type") == "text":
+                parts.append(part.get("text", ""))
+        elif getattr(part, "type", None) == "text":
+            parts.append(part.text)
+    return "\n".join(parts)
+
+
 class Star:
     def __init__(self, context):
         self.context = context
@@ -74,6 +97,8 @@ def _load_plugin():
         "astrbot.api.provider": {"ProviderRequest": object},
         "astrbot.api.star": {"Context": object, "Star": Star, "StarTools": object},
         "astrbot.core": {},
+        "astrbot.core.agent": {},
+        "astrbot.core.agent.message": {"TextPart": TextPart},
         "astrbot.core.message": {},
         "astrbot.core.message.components": {
             "Plain": Plain,
@@ -115,7 +140,7 @@ def _native_pipeline(plugin, reply="reply"):
         await plugin.inject_stage_direction(event, req)
         if event.stopped:
             return
-        text = await plugin.native_generate(prompt=req.prompt)
+        text = await plugin.native_generate(prompt=_request_text(req))
         if not text or not await plugin._glance_can_send(plugin._chat(event.unified_msg_origin), event):
             return
         ok = await plugin.context.send_message(event.unified_msg_origin, [Plain(text)])

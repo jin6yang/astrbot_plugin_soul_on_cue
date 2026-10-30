@@ -4,7 +4,7 @@ import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from test_timing import Plain, _event, plugin_module
+from test_timing import Plain, _event, _request_text, plugin_module
 
 
 def at(target=None, name=""):
@@ -208,10 +208,11 @@ class ContextTests(unittest.IsolatedAsyncioTestCase):
         self.cache(self.event(reply("m1", sender_id="bob", message_str="值班吗"), Plain("明天")))
         history = self.plugin._history_text(self.chat)
         event = _event()
-        event.set_extra("oncue_decision", {"should_reply": True, "_chat_context": history})
+        event.set_extra("oncue_decision", {"should_reply": True, "_chat_context": self.plugin._context_snapshot(self.chat)})
         req = SimpleNamespace(system_prompt="原生人格", prompt="主动发言机会")
         await self.plugin.inject_stage_direction(event, req)
-        prompt = req.prompt
+        prompt = _request_text(req)
+        self.assertEqual(req.prompt, "主动发言机会")
         self.assertTrue(req.system_prompt.startswith("原生人格"))
         self.assertIn(history, prompt)
         self.assertIn("作者=成员（ID=bob）", prompt)

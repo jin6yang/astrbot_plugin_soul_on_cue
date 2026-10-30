@@ -23,11 +23,12 @@ class SummonTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config["force_reply_when_summoned"] = True
         await self.plugin.on_message(self.event)
         self.plugin._llm_decision.assert_not_awaited()
-        req = SimpleNamespace(prompt="原请求", system_prompt="AstrBot 人格")
+        req = SimpleNamespace(prompt="你想聊聊吗", system_prompt="AstrBot 人格")
         await self.plugin.inject_stage_direction(self.event, req)
         self.assertTrue(self.event.is_at_or_wake_command)
         self.assertTrue(req.system_prompt.startswith("AstrBot 人格"))
         self.assertIn("你想聊聊吗", req.prompt)
+        self.assertTrue(req.extra_user_content_parts[0]._no_save)
         self.assertNotIn("决策角色卡", req.system_prompt)
 
     async def test_decision_mode_can_reply_and_uses_same_direction_hook(self):
@@ -35,7 +36,7 @@ class SummonTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._llm_decision.assert_awaited_once()
         self.assertTrue(self.event.is_at_or_wake_command)
         self.assertEqual(len(self.chat.pending_replies), 1)
-        req = SimpleNamespace(prompt="原请求", system_prompt="AstrBot 人格")
+        req = SimpleNamespace(prompt="你想聊聊吗", system_prompt="AstrBot 人格")
         await self.plugin.inject_stage_direction(self.event, req)
         self.assertIn("愉快", req.system_prompt)
         self.assertIn("你想聊聊吗", req.prompt)

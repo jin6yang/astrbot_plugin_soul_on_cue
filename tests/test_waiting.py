@@ -6,7 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 from test_context import at, reply
-from test_timing import Plain, _event, plugin_module
+from test_timing import Plain, _event, _request_text, plugin_module
 
 
 POSITIVE = '{"should_reply": true, "reason": "想接话"}'
@@ -128,7 +128,8 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         req = self.request()
         await self.plugin.inject_stage_direction(self.event, req)
         self.assertTrue(req.prompt.startswith("原始消息"))
-        self.assertIn(self.event.get_extra("oncue_decision")["_chat_context"], req.prompt)
+        self.assertIn("正文及附件见本次原生输入", _request_text(req))
+        self.assertEqual(req.prompt, "原始消息")
 
     async def test_empty_message_does_not_restart_quiet_wait(self):
         task = await self.start()
@@ -347,7 +348,7 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await self.finish(task)
         self.plugin._llm_decision.assert_awaited_once()
-        context = self.event.get_extra("oncue_decision")["_chat_context"]
+        context = self.event.get_extra("oncue_decision")["_chat_context"].render()
         self.assertIn("等待阶段的补充", context)
         self.assertNotIn("模型开始后的新消息", context)
 
@@ -359,23 +360,25 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_message(second)
         await self.advance(2)
         await self.finish(task)
-        snapshot = self.event.get_extra("oncue_decision")["_chat_context"]
+        snapshot = self.event.get_extra("oncue_decision")["_chat_context"].render()
         self.assertIn(snapshot, self.plugin._llm_decision.call_args.args[1])
         req = self.request()
         await self.plugin.inject_stage_direction(self.event, req)
         await self.plugin.inject_stage_direction(self.event, req)
-        self.assertIn(snapshot, req.prompt)
-        self.assertIn("预算八千", req.prompt)
-        self.assertIn("[引用", req.prompt)
-        self.assertIn("ID=carol", req.prompt)
-        self.assertTrue(req.prompt.startswith("原始消息"))
-        self.assertEqual(req.prompt.count("[群聊补充上下文]"), 1)
+        supplied = _request_text(req)
+        self.assertIn("预算八千", supplied)
+        self.assertIn("[引用", supplied)
+        self.assertIn("ID=carol", supplied)
+        self.assertEqual(req.prompt, "原始消息")
+        self.assertEqual(supplied.count("[群聊补充上下文]"), 1)
+        self.assertEqual(req.system_prompt.count("[导演指令]"), 1)
         self.assertEqual(req.image_urls, ["original-image"])
         self.assertEqual(req.contexts, [])
         self.assertNotIn(snapshot, req.system_prompt)
         empty_prompt = self.request(None)
         await self.plugin.inject_stage_direction(self.event, empty_prompt)
-        self.assertIn(snapshot, empty_prompt.prompt)
+        self.assertIn("预算八千", _request_text(empty_prompt))
+        self.assertIsNone(empty_prompt.prompt)
 
     async def test_new_message_at_admission_restarts_wait_before_model_call(self):
         original_decide = self.plugin._decide
