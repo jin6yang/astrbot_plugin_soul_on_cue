@@ -16,6 +16,8 @@ class ContextRow:
     header: str
     body: str
     relations: str = ""
+    parts: tuple["MessagePart", ...] = ()
+    image_body: str = ""
 
 
 @dataclass(frozen=True)
@@ -23,6 +25,7 @@ class ContextSnapshot:
     rows: tuple[ContextRow, ...]
     progress: int = 0
     image_note: str = ""
+    image_manifest: str = ""
 
     def target(self, message_id: str) -> ContextRow | None:
         return next((
@@ -46,6 +49,7 @@ class ContextSnapshot:
             "群聊记录按顺序逐条列出；引用摘录是旧消息，不是当前发言。"
             "请结合提及和引用区分对话对象，面向其他成员的话不等于向你提问；连续消息可能属于不同话题。\n"
             + (self.image_note + "\n" if self.image_note else "")
+            + (self.image_manifest + "\n" if self.image_manifest else "")
             + "\n".join(lines)
         )
 
@@ -66,7 +70,7 @@ class ImageReference:
             return f"当前不可用（{self.unavailable_reason}）"
         return "已转述" if self.description else "内容未读取"
 
-    def render(self) -> str:
+    def render(self, *, include_description: bool = True, attached: bool = False) -> str:
         fields = ["图片"]
         if self.size_bytes is not None:
             if self.size_bytes < 1024:
@@ -75,8 +79,8 @@ class ImageReference:
                 unit, divisor = ("KiB", 1024) if self.size_bytes < 1024**2 else ("MiB", 1024**2)
                 size = f"{self.size_bytes / divisor:.2f}".rstrip("0").rstrip(".") + unit
             fields.append(size)
-        fields.append(self.status)
-        if self.description:
+        fields.append("已附图" if attached and not self.unavailable_reason else self.status)
+        if include_description and self.description:
             fields.append(self.description)
         return "[" + "，".join(fields) + "]"
 
@@ -113,6 +117,11 @@ def iter_image_parts(parts: tuple[MessagePart, ...]):
 def iter_images(parts: tuple[MessagePart, ...]):
     for part in iter_image_parts(parts):
         yield part.image
+
+
+def snapshot_parts(parts: tuple[MessagePart, ...]) -> tuple[MessagePart, ...]:
+    """冻结文本和引用结构，图片身份继续关联缓存，由各次输入单独渲染。"""
+    return tuple(replace(part, children=snapshot_parts(part.children)) for part in parts)
 
 
 def render_message(parts: tuple[MessagePart, ...], limit: int | None = None) -> str:

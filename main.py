@@ -13,13 +13,16 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.core.agent.message import TextPart
+from astrbot.core.agent.message import ImageURLPart, TextPart
 from astrbot.core.message.components import At, Image, Plain, Reply
 from astrbot.core.message.message_event_result import ResultContentType
 
 from .context_injection import add_stage_direction, request_background, set_temporary_background
 from .image_cache import CacheLimits, SessionImageCache
-from .message_context import ContextRow, ContextSnapshot, ImageReference, MessagePart, iter_image_parts, iter_images, render_message
+from .image_caption import CaptionRound, ImageCaptionService
+from .image_input import ImageInputPreparer
+from .image_models import ImageModels
+from .message_context import ContextRow, ContextSnapshot, ImageReference, MessagePart, iter_image_parts, iter_images, render_message, snapshot_parts
 
 
 MESSAGE_CACHE_LIMIT = 300
@@ -99,6 +102,9 @@ class OnCuePlugin(Star):
         self._context_conflict_signatures: dict[str, tuple[str, ...]] = {}
         self.image_cache: SessionImageCache | None = None
         self.image_cache_task: asyncio.Task | None = None
+        self.image_models = ImageModels(context, self._cfg_value, logger)
+        self.image_captions: ImageCaptionService | None = None
+        self.image_input: ImageInputPreparer | None = None
 
     async def initialize(self) -> None:
         try:
@@ -106,6 +112,11 @@ class OnCuePlugin(Star):
             self.image_cache = SessionImageCache(
                 self.data_dir / "images", limits=self._image_cache_limits, logger=logger,
             )
+            self.image_captions = ImageCaptionService(
+                self.image_cache, self.image_models.caption,
+                concurrency=lambda: max(1, self._cfg_int("image_caption_concurrency", 2)), logger=logger,
+            )
+            self.image_input = ImageInputPreparer(self.image_cache, self.image_captions, logger=logger)
             self.image_cache_task = asyncio.create_task(self._image_cleanup_loop())
             self.glance_file = self.data_dir / "glance.json"
             self._load_glance()
@@ -135,8 +146,64 @@ class OnCuePlugin(Star):
                 pass
             self.glance_task = None
         if self.image_cache:
+            if self.image_captions:
+                await self.image_captions.close()
+                self.image_captions = None
+            self.image_input = None
             await self.image_cache.close()
             self.image_cache = None
+
+    def _image_mode(self) -> str:
+        return {
+            "不转述（仅占位）": "placeholder", "仅转述": "describe", "混合（视觉优先）": "mixed",
+        }.get(self._cfg_str("image_mode", "混合（视觉优先）"), "mixed")
+
+    def _new_image_round(self, chat: ChatFacts) -> CaptionRound:
+        version = chat.reply_version
+        return CaptionRound(
+            max(0, self._cfg_int("image_caption_budget", 3)),
+            is_active=lambda: (
+                not self._terminating and self._cfg_bool("enable", True)
+                and chat.reply_version == version and self._image_mode() != "placeholder"
+                and self._cfg_int("image_caption_budget", 3) > 0
+                and self.image_models.caption_available()
+            ),
+        )
+
+    @staticmethod
+    def _close_image_round(event: AstrMessageEvent) -> None:
+        budget = event.get_extra("oncue_image_round")
+        if isinstance(budget, CaptionRound):
+            budget.close()
+            event.set_extra("oncue_image_round", None)
+
+    async def _decision_images(self, event, chat, snapshot, budget):
+        if self.image_input is None or not any(any(iter_images(row.parts)) for row in snapshot.rows):
+            return snapshot, None, []
+        provider_id, vision = await self.image_models.decision_provider(event.unified_msg_origin)
+        if not provider_id:
+            return snapshot, None, []
+        focus = tuple(dict.fromkeys(record for record in (
+            event.get_extra("oncue_record_id"),
+            next((row.record_id for row in reversed(snapshot.rows) if row.role == "user"), None),
+        ) if record))
+        prepared = await self._prepare_images(
+            event.unified_msg_origin, snapshot, vision=vision,
+            round=budget, focus_records=focus,
+            max_images=max(0, self._cfg_int("image_request_count", 5)),
+            message_char_limit=max(1, self._cfg_int("message_char_limit", 500)),
+            max_size=self.image_models.image_max_size(event.unified_msg_origin),
+        )
+        return prepared.snapshot, provider_id, prepared.image_urls
+
+    async def _prepare_images(self, chat_id, snapshot, **options):
+        mode = self._image_mode()
+        prepared = await self.image_input.prepare(chat_id, snapshot, mode=mode, **options)
+        latest = self._image_mode()
+        if latest != mode and latest in {"placeholder", "describe"}:
+            # 等待期间收紧模式时重建本次表示，已发生的转述结果仍可留作缓存。
+            prepared = await self.image_input.prepare(chat_id, prepared.snapshot, mode=latest, **options)
+        return prepared
 
     def _image_cache_limits(self) -> CacheLimits:
         return CacheLimits(
@@ -240,6 +307,10 @@ class OnCuePlugin(Star):
             if isinstance(active_reply, dict) and active_reply.get("enable", False):
                 causes.append("主动回复")
                 details.append("AstrBot「主动回复」已启用，可能绕过本插件的参与决策，并额外注入群聊记录")
+            native_caption = get_config(umo=umo).get("provider_settings", {}).get("default_image_caption_provider_id")
+            if native_caption:
+                causes.append("原生图片转述")
+                details.append("原生「图片转述模型」未留空，可能与插件图片模式或转述调用重复；请留空并在插件内选择转述模型")
         except Exception as exc:
             logger.debug(f"[OnCue] 无法检查会话上下文配置: {umo} | {exc}")
             return
@@ -353,6 +424,8 @@ class OnCuePlugin(Star):
             if await self._decide(event, chat, "你刚忙完自己的事，顺手瞄了一眼群聊。", "glance"):
                 await self._run_native_reply(event)
         finally:
+            if event is not None:
+                self._close_image_round(event)
             try:
                 # 原生工具发送/部分分段发送可能没有最终钩子，只补记有发送凭据的内容。
                 if event is not None and event._has_send_oper and event.get_extra("oncue_decision"):
@@ -690,6 +763,7 @@ class OnCuePlugin(Star):
             records.append(ContextRow(
                 m["record_id"], message_id, m["role"], f"[{sender} / {m['time_str']}{reference}]", text,
                 render_message(tuple(relations), limit),
+                snapshot_parts(m["parts"]),
             ))
         has_images = any(any(iter_images(m["parts"])) for m in rows)
         note = ""
@@ -745,12 +819,13 @@ class OnCuePlugin(Star):
             template += "\n\n知识库联动：如果这次开口需要外部资料才能答好，在同一个 JSON 里增加 \"need_kb\": true 和 \"kb_query\": \"独立检索词\"；否则省略或设为 false。kb_query 不要照抄群聊原话。"
         return template
 
-    async def _llm_decision(self, umo: str, prompt: str) -> str:
-        provider_id = self._cfg_str("analyzer_provider").strip()
+    async def _llm_decision(self, umo: str, prompt: str, *, provider_id: str | None = None, image_urls=None) -> str:
+        provider_id = provider_id or self._cfg_str("analyzer_provider").strip()
         try:
             if not provider_id:
                 provider_id = await self.context.get_current_chat_provider_id(umo=umo)
-            resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt)
+            options = {"image_urls": image_urls} if image_urls else {}
+            resp = await self.context.llm_generate(chat_provider_id=provider_id, prompt=prompt, **options)
             return resp.completion_text or ""
         except Exception as e:
             logger.error(f"[OnCue] 决策 LLM 调用失败，本次按沉默处理: {e}")
@@ -906,6 +981,9 @@ class OnCuePlugin(Star):
             reply_version = chat.reply_version
             owner = object()
             chat.decision_inflight = owner
+            image_round = self._new_image_round(chat)
+            event.set_extra("oncue_image_round", image_round)
+        accepted = False
 
         def current(now: float) -> bool:
             # 仅在持有会话锁时调用；模型与知识库请求均在锁外。
@@ -919,6 +997,10 @@ class OnCuePlugin(Star):
 
         try:
             for attempt in range(2):
+                if self.image_input is not None and any(any(iter_images(row.parts)) for row in snapshot.rows):
+                    if await self._decision_card() is None:
+                        return False
+                snapshot, image_provider, image_urls = await self._decision_images(event, chat, snapshot, image_round)
                 prompt = await self._build_prompt(snapshot.render(), entry_context)
                 if prompt is None:
                     return False
@@ -926,7 +1008,8 @@ class OnCuePlugin(Star):
                     if not current(time.time()) or (attempt and not self._cfg_bool("enable_extra_decision", True)):
                         return False
                 logger.info(f"[OnCue] 决策调用: source={source} | 第 {attempt + 1} 次 | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
-                raw = await self._llm_decision(event.unified_msg_origin, prompt)
+                image_options = {"provider_id": image_provider, "image_urls": image_urls} if image_provider else {}
+                raw = await self._llm_decision(event.unified_msg_origin, prompt, **image_options)
                 decision = self._parse_decision(raw)
                 target_id = decision["target_message_id"]
                 decision["_target"] = snapshot.target(target_id) if target_id else None
@@ -975,6 +1058,7 @@ class OnCuePlugin(Star):
                     decision["_chat_context"] = snapshot
                     chat.cooldown_until = max(chat.cooldown_until, now + self._cfg_int("reply_cooldown", 10))
                     event.set_extra("oncue_decision", decision)
+                    accepted = True
                     event.is_at_or_wake_command = True
                     logger.info(f"[OnCue] 决定回复: source={source} | {decision['reason']}")
                     return True
@@ -984,6 +1068,10 @@ class OnCuePlugin(Star):
                 logger.info(f"[OnCue] 决定沉默: source={source} | 冷却 {cooldown}s | {decision['reason'] or raw[:80]}")
                 return False
         finally:
+            if not accepted:
+                image_round.close()
+                if event.get_extra("oncue_image_round") is image_round:
+                    event.set_extra("oncue_image_round", None)
             async with chat.lock:
                 if chat.decision_inflight is owner:
                     chat.decision_inflight = None
@@ -1054,6 +1142,7 @@ class OnCuePlugin(Star):
     def _discard_decision(event: AstrMessageEvent, chat: ChatFacts) -> None:
         """持有会话锁时释放本事件名额，不影响新事件的占用。"""
         decision = event.get_extra("oncue_decision")
+        OnCuePlugin._close_image_round(event)
         if isinstance(decision, dict):
             chat.pending_replies.pop(decision.get("_reservation"), None)
             event.set_extra("oncue_decision", None)
@@ -1138,17 +1227,45 @@ class OnCuePlugin(Star):
         elif trigger:
             await self._decide(event, chat, *trigger, summoned_version=summoned_version)
 
+    @filter.on_waiting_llm_request()
+    async def note_native_image_request(self, event: AstrMessageEvent):
+        decision = event.get_extra("oncue_decision")
+        if isinstance(decision, dict) and decision.get("should_reply"):
+            event.set_extra("oncue_native_image_request", event.get_extra("provider_request") is None)
+
+    @filter.on_agent_done()
+    async def close_image_requests(self, event: AstrMessageEvent, run_context, response):
+        self._close_image_round(event)
+
     @filter.on_llm_request()
     async def inject_stage_direction(self, event: AstrMessageEvent, req: ProviderRequest):
-        if not self._cfg_bool("enable", True):
-            return
+        try:
+            await self._inject_stage_direction(event, req)
+        except BaseException:
+            chat = self.chats.get(event.unified_msg_origin)
+            if chat is not None:
+                async with chat.lock:
+                    self._discard_decision(event, chat)
+            else:
+                self._close_image_round(event)
+            event.stop_event()
+            raise
+
+    async def _inject_stage_direction(self, event: AstrMessageEvent, req: ProviderRequest):
         decision = event.get_extra("oncue_decision")
         if not isinstance(decision, dict) or not decision.get("should_reply"):
             return
+        chat = self._chat(event.unified_msg_origin)
+        async with chat.lock:
+            if (
+                self._terminating or not self._cfg_bool("enable", True)
+                or ("_reply_version" in decision and decision["_reply_version"] != chat.reply_version)
+                or (decision.get("_backoff_key") == "glance" and not self._cfg_bool("enable_glance", False))
+            ):
+                self._discard_decision(event, chat)
+                event.stop_event()
+                return
         self._check_context_conflict(event)
-        if decision.get("_backoff_key") == "glance" and not await self._glance_can_send(self._chat(event.unified_msg_origin), event):
-            event.stop_event()
-            return
         speaker = decision.get("speaker", "").strip()
         mood = decision.get("mood", "").strip()
         if self._cfg_bool("enable_speaker_routing", False) and speaker:
@@ -1165,11 +1282,63 @@ class OnCuePlugin(Star):
         context = ""
         snapshot = decision.get("_chat_context")
         if isinstance(snapshot, ContextSnapshot):
+            target = decision.get("_target")
+            include_history = self._cfg_bool("enable_context_injection", True)
+            mode = self._image_mode()
+            native_owned = event.get_extra("oncue_native_image_request", False)
+            native_images = list(getattr(req, "image_urls", None) or [])
+            if native_owned and mode in {"placeholder", "describe"}:
+                req.image_urls = []
+                native_images = []
+            budget = event.get_extra("oncue_image_round")
+            if not isinstance(budget, CaptionRound) or budget.closed:
+                budget = self._new_image_round(self._chat(event.unified_msg_origin))
+                event.set_extra("oncue_image_round", budget)
+            direct_images = []
+            working = snapshot
+            if not include_history:
+                current_id = event.get_extra("oncue_record_id")
+                rows = (target,) if target is not None else tuple(row for row in snapshot.rows if row.record_id == current_id)
+                working = ContextSnapshot(rows, snapshot.progress, snapshot.image_note)
+            if self.image_input is not None:
+                previous = getattr(req, "_oncue_image_parts", ())
+                extras = [part for part in (getattr(req, "extra_user_content_parts", ()) or ()) if not any(part is own for own in previous)]
+                extra_count = sum(1 for part in extras if (part.get("type") if isinstance(part, dict) else getattr(part, "type", None)) == "image_url")
+                skip = set()
+                if native_images:
+                    for row in working.rows:
+                        if row.record_id == event.get_extra("oncue_record_id"):
+                            skip.update(image.image_id for image in iter_images(row.parts))
+                prepared = await self._prepare_images(
+                    event.unified_msg_origin, working,
+                    vision=self.image_models.reply_vision(event, req), round=budget,
+                    focus_records=(target.record_id,) if target else tuple(row.record_id for row in working.rows[-1:]),
+                    max_images=max(0, self._cfg_int("image_request_count", 5) - len(native_images) - extra_count),
+                    image_offset=extra_count, skip_direct_ids=skip,
+                    message_char_limit=max(1, self._cfg_int("message_char_limit", 500)),
+                    max_size=self.image_models.image_max_size(event.unified_msg_origin),
+                )
+                working, direct_images = prepared.snapshot, prepared.image_urls
+                if native_owned and self._image_mode() in {"placeholder", "describe"}:
+                    req.image_urls = []
+                target = working.target(target.message_id or target.record_id) if target else None
+                chat = self._chat(event.unified_msg_origin)
+                async with chat.lock:
+                    if (
+                        self._terminating or not self._cfg_bool("enable", True)
+                        or ("_reply_version" in decision and decision["_reply_version"] != chat.reply_version)
+                    ):
+                        self._discard_decision(event, chat)
+                        event.stop_event()
+                        return
             context = request_background(
-                snapshot, event, req, target=decision.get("_target"),
-                include_history=self._cfg_bool("enable_context_injection", True),
+                working, event, req, target=target, include_history=True,
             )
-        set_temporary_background(req, context, TextPart)
+            if not include_history and target is None and not any(row.image_body for row in working.rows):
+                context = ""
+            set_temporary_background(req, context, TextPart, images=direct_images, image_part_type=ImageURLPart)
+        else:
+            set_temporary_background(req, context, TextPart)
 
     @filter.on_decorating_result()
     async def mark_streaming_reply_sent(self, event: AstrMessageEvent):
@@ -1180,6 +1349,7 @@ class OnCuePlugin(Star):
 
     @filter.after_message_sent()
     async def mark_reply_sent(self, event: AstrMessageEvent):
+        self._close_image_round(event)
         decision = event.get_extra("oncue_decision")
         if not isinstance(decision, dict) or not decision.get("should_reply"):
             return

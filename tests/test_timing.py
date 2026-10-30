@@ -29,6 +29,14 @@ class TextPart:
         return self
 
 
+class ImageURLPart(TextPart):
+    type = "image_url"
+
+    def __init__(self, *, image_url):
+        self.image_url = SimpleNamespace(**image_url)
+        self._no_save = False
+
+
 def _request_text(req):
     parts = [req.prompt] if req.prompt else []
     for part in getattr(req, "extra_user_content_parts", []):
@@ -90,6 +98,8 @@ def _load_plugin():
                 EventMessageType=SimpleNamespace(GROUP_MESSAGE=1),
                 event_message_type=decorator,
                 on_llm_request=decorator,
+                on_waiting_llm_request=decorator,
+                on_agent_done=decorator,
                 on_decorating_result=decorator,
                 after_message_sent=decorator,
             ),
@@ -98,7 +108,7 @@ def _load_plugin():
         "astrbot.api.star": {"Context": object, "Star": Star, "StarTools": object},
         "astrbot.core": {},
         "astrbot.core.agent": {},
-        "astrbot.core.agent.message": {"TextPart": TextPart},
+        "astrbot.core.agent.message": {"TextPart": TextPart, "ImageURLPart": ImageURLPart},
         "astrbot.core.message": {},
         "astrbot.core.message.components": {
             "Plain": Plain,

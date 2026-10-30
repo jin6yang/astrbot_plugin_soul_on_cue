@@ -10,7 +10,7 @@ def request_background(
     if not include_history:
         if target is None:
             return ""
-        snapshot = ContextSnapshot((target,), snapshot.progress, snapshot.image_note)
+        snapshot = ContextSnapshot((target,), snapshot.progress, snapshot.image_note, snapshot.image_manifest)
     bodies = {}
     if (req.prompt and req.prompt.strip()) or getattr(req, "image_urls", None) or getattr(req, "audio_urls", None):
         current_id = event.get_extra("oncue_record_id")
@@ -21,6 +21,7 @@ def request_background(
                 # 在原位置替换正文，不能把合并等待中的首条消息移到最后。
                 bodies[current_id] = (
                     (current_row.relations + " " if current_row.relations else "")
+                    + (current_row.image_body + " " if current_row.image_body else "")
                     + "[正文及附件见本次原生输入]"
                 )
 
@@ -60,15 +61,22 @@ def request_background(
     )
 
 
-def set_temporary_background(req, text: str, text_part_type) -> None:
+def set_temporary_background(req, text: str, text_part_type, *, images=(), image_part_type=None) -> None:
     """只替换本插件在同一请求中拥有的内容块，不动其他插件的内容。"""
     owned = getattr(req, "_oncue_context_part", None)
-    parts = [part for part in (getattr(req, "extra_user_content_parts", None) or []) if part is not owned]
+    owned_images = getattr(req, "_oncue_image_parts", ())
+    parts = [
+        part for part in (getattr(req, "extra_user_content_parts", None) or [])
+        if part is not owned and not any(part is own for own in owned_images)
+    ]
     new_part = text_part_type(text=text).mark_as_temp() if text else None
     if new_part is not None:
         parts.append(new_part)
+    new_images = [image_part_type(image_url={"url": url}).mark_as_temp() for url in images] if image_part_type else []
+    parts.extend(new_images)
     req.extra_user_content_parts = parts
     req._oncue_context_part = new_part
+    req._oncue_image_parts = new_images
 
 
 def add_stage_direction(req, line: str) -> None:

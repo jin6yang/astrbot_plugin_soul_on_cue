@@ -51,6 +51,11 @@ def load_provider_request(path: Path, message_models: ModuleType):
         logger=logging.getLogger(__name__),
         json=json,
     )
+    async def resolve_inline_image(url):
+        if not url.startswith("data:image/"):
+            raise ValueError("This contract check never fetches remote media")
+        return SimpleNamespace(to_data_url=lambda: url)
+    module.resolve_image_ref_to_base64_data = resolve_inline_image
     sys.modules[module.__name__] = module
     exec(compile(source, str(path), "exec"), module.__dict__)
     return module.ProviderRequest
@@ -96,9 +101,17 @@ async def check_contract(message_models: ModuleType, provider_request) -> None:
     assert len(background_parts) == 1, "Background must be injected exactly once"
     assert background_parts[0]._no_save, "Background must be marked as temporary"
 
+    # Use the actual image content model through the plugin's owned-part helper.
+    inline_image = "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+aL1cAAAAASUVORK5CYII="
+    plugin_module.set_temporary_background(
+        request, background_parts[0].text, message_models.TextPart,
+        images=[inline_image], image_part_type=message_models.ImageURLPart,
+    )
+
     assembled = await request.assemble_context()
     assert "BACKGROUND_CONTRACT_MARKER" in json.dumps(assembled)
     assert "[本次回应目标]" in json.dumps(assembled, ensure_ascii=False)
+    assert inline_image in json.dumps(assembled), "Temporary image must reach the model"
     current_message = message_models.Message.model_validate(assembled)
     assert any(
         getattr(part, "_no_save", False) and "BACKGROUND_CONTRACT_MARKER" in getattr(part, "text", "")
@@ -111,6 +124,7 @@ async def check_contract(message_models: ModuleType, provider_request) -> None:
     saved_json = json.dumps(saved)
     assert "BACKGROUND_CONTRACT_MARKER" not in saved_json, "Temporary background leaked into history"
     assert "[本次回应目标]" not in json.dumps(saved, ensure_ascii=False), "Reply target leaked into history"
+    assert inline_image not in saved_json, "Temporary image leaked into history"
     assert "ORIGINAL_CURRENT_MESSAGE" in saved_json, "Original user message must remain persisted"
     assert "EXISTING_NATIVE_HISTORY" in saved_json, "Existing history must remain persisted"
     assert saved[-1] == {"role": "assistant", "content": "REPLY"}
