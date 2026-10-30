@@ -316,18 +316,105 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("中间省略", body)
         self.assertLessEqual(len(body), 120)
 
-    async def test_default_encoder_keeps_lease_until_cancelled_worker_really_finishes(self):
+    async def test_default_encoder_uses_public_preprocessing_and_keeps_borrowed_source(self):
+        media = ModuleType("astrbot.core.utils.media_utils")
+        directories = []
+
+        async def preview(source, *, max_size, output_dir):
+            self.assertEqual(max_size, 333)
+            directories.append(output_dir)
+            return source, False, False, source
+
+        media.prepare_model_image = AsyncMock(side_effect=preview)
+        ref = self.image()
+        with patch.dict(sys.modules, {media.__name__: media}):
+            async with self.cache.acquire("chat", ref) as cached:
+                source = cached.path
+                encoded = await input_module.encode_cached_image(cached, max_size=333)
+                self.assertIsNotNone(encoded)
+                self.assertFalse(encoded.is_montage)
+                self.assertEqual(source.read_bytes(), b"image")
+                self.assertEqual(media.prepare_model_image.call_args.args, (str(source),))
+        media.prepare_model_image.assert_awaited_once()
+        self.assertTrue(source.exists())
+        self.assertFalse(directories[0].exists())
+
+    async def test_default_encoder_cleans_native_owned_preview_after_capturing_bytes(self):
+        media = ModuleType("astrbot.core.utils.media_utils")
+        previews = []
+
+        async def preview(source, *, max_size, output_dir):
+            output = output_dir / "native-preview.jpg"
+            output.write_bytes(b"\xff\xd8preview")
+            previews.append(output)
+            return str(output), True, True, source
+
+        media.prepare_model_image = AsyncMock(side_effect=preview)
+        with patch.dict(sys.modules, {media.__name__: media}):
+            async with self.cache.acquire("chat", self.image()) as cached:
+                encoded = await input_module.encode_cached_image(cached)
+                self.assertTrue(encoded.is_montage)
+                self.assertTrue(encoded.data_uri.startswith("data:image/jpeg;base64,"))
+                self.assertEqual(cached.path.read_bytes(), b"image")
+        self.assertFalse(previews[0].exists())
+        self.assertFalse(previews[0].parent.exists())
+
+    async def test_native_refusal_or_failure_is_not_bypassed(self):
+        class ImageInputTooLargeError(ValueError):
+            pass
+
+        for index, response in enumerate((None, ImageInputTooLargeError("native cap"), RuntimeError("native failure"))):
+            with self.subTest(response=response):
+                media = ModuleType("astrbot.core.utils.media_utils")
+                media.prepare_model_image = AsyncMock(
+                    side_effect=response if isinstance(response, Exception) else None,
+                    return_value=response,
+                )
+                with patch.dict(sys.modules, {media.__name__: media}):
+                    async with self.cache.acquire("chat", self.image(str(index))) as cached:
+                        self.assertIsNone(await input_module.encode_cached_image(cached, logger=self.logger))
+                        self.assertEqual(cached.path.read_bytes(), b"image")
+                media.prepare_model_image.assert_awaited_once()
+        self.assertEqual(self.logger.warning.call_count, 2)
+        self.assertIn("ImageInputTooLargeError", self.logger.warning.call_args_list[0].args[0])
+
+    async def test_preview_read_failure_still_cleans_only_owned_output(self):
+        media = ModuleType("astrbot.core.utils.media_utils")
+        directories = []
+
+        async def preview(source, *, max_size, output_dir):
+            directories.append(output_dir)
+            (output_dir / "owned-working-file").write_bytes(b"partial")
+            return str(output_dir / "missing-preview.png"), False, True, source
+
+        media.prepare_model_image = AsyncMock(side_effect=preview)
+        with patch.dict(sys.modules, {media.__name__: media}):
+            async with self.cache.acquire("chat", self.image()) as cached:
+                self.assertIsNone(await input_module.encode_cached_image(cached, logger=self.logger))
+                self.assertEqual(cached.path.read_bytes(), b"image")
+        self.assertFalse(directories[0].exists())
+        self.logger.warning.assert_called_once()
+
+    async def test_default_encoder_keeps_lease_until_cancelled_public_processing_finishes(self):
         entered, release = threading.Event(), threading.Event()
         paths = []
+        previews = []
         media = ModuleType("astrbot.core.utils.media_utils")
 
-        def preview(data, max_size):
-            entered.set()
-            if not release.wait(3):
-                raise RuntimeError("test worker was not released")
-            return b"\x89PNG\r\n\x1a\npreview", False
+        async def preview(source, *, max_size, output_dir):
+            def work():
+                entered.set()
+                if not release.wait(3):
+                    raise RuntimeError("test worker was not released")
+                self.assertEqual(Path(source).read_bytes(), b"image")
+                output = output_dir / "native-preview.png"
+                output.write_bytes(b"\x89PNG\r\n\x1a\npreview")
+                previews.append(output)
+                return str(output), False, True, source
 
-        media._prepare_model_image_sync = preview
+            return await asyncio.to_thread(work)
+
+        media.prepare_model_image = preview
         self.preparer = ImageInputPreparer(self.cache, self.captions, logger=self.logger)
         ref = self.image()
         row = self.row("one", MessagePart("image", image=ref))
@@ -339,6 +426,8 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(paths), 1)
                 task.cancel()
                 await asyncio.sleep(0)
+                task.cancel()
+                await asyncio.sleep(0)
                 await self.cache.close()
                 self.assertFalse(task.done())
                 self.assertTrue(paths[0].exists())
@@ -346,6 +435,8 @@ class ImageInputTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(asyncio.CancelledError):
                     await task
                 self.assertFalse(paths[0].exists())
+                self.assertFalse(previews[0].exists())
+                self.assertFalse(previews[0].parent.exists())
             finally:
                 release.set()
                 await asyncio.gather(task, return_exceptions=True)

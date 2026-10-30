@@ -8,6 +8,7 @@ import argparse
 import ast
 import asyncio
 import logging
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
@@ -30,10 +31,24 @@ class Reply:
     message_str = "quoted text"
 
 
+@dataclass
+class InputRequest:
+    """Serialization stub; native routing and modality filtering run unchanged."""
+
+    image_urls: list[str] = field(default_factory=list)
+    audio_urls: list[str] = field(default_factory=list)
+
+    async def assemble_context(self):
+        return {"role": "user", "content": [
+            {"type": "image_url", "image_url": {"url": url}} for url in self.image_urls
+        ]}
+
+
 def load_caption_branches(path):
     names = {
         "_provider_supports_modality", "_decorate_llm_request", "_process_quote_message",
         "_request_img_caption", "_ensure_img_caption", "_select_provider",
+        "_select_image_chat_provider",
     }
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     nodes = [node for node in tree.body if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in names]
@@ -54,6 +69,18 @@ def load_caption_branches(path):
     ], type_ignores=[])
     exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
     return namespace
+
+
+def load_request_assembler(path):
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    runner = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == "ToolLoopAgentRunner")
+    method = next(node for node in runner.body if isinstance(node, ast.AsyncFunctionDef) and node.name == "_assemble_request_context_for_provider")
+    module = ast.Module(body=[
+        ast.ImportFrom(module="__future__", names=[ast.alias(name="annotations")], level=0), method,
+    ], type_ignores=[])
+    namespace = {"replace": replace}
+    exec(compile(ast.fix_missing_locations(module), str(path), "exec"), namespace)
+    return namespace[method.name]
 
 
 async def check(source):
@@ -94,9 +121,24 @@ async def check(source):
     assert await native["_select_provider"](route_event, route_context) is default
     route_context.get_provider_by_id.assert_not_called()
     route_context.get_using_provider_async.assert_awaited_once_with(umo=event.unified_msg_origin)
+
+    # The caption selector does not gate native attachments. The actual provider
+    # controls their final representation, independently of caption generation.
+    request = InputRequest(image_urls=["already-downloaded.png"])
+    text_provider, vision_provider = Provider(), Provider()
+    text_provider.provider_config = {"id": "text", "modalities": ["text"]}
+    vision_provider.provider_config = {"id": "vision", "modalities": ["text", "image"]}
+    assembler = load_request_assembler(source / "astrbot/core/agent/runners/tool_loop_agent_runner.py")
+    text_input = await assembler(SimpleNamespace(provider=text_provider), request)
+    assert text_input["content"] == [{"type": "text", "text": "[Image]"}]
+    vision_input = await assembler(SimpleNamespace(provider=vision_provider), request)
+    assert vision_input["content"] == [{"type": "image_url", "image_url": {"url": "already-downloaded.png"}}]
+    assert request.image_urls == ["already-downloaded.png"], "Filtering must not mutate the shared request"
+    assert native["_select_image_chat_provider"](text_provider, request, [vision_provider]) is vision_provider
+    assert native["_select_image_chat_provider"](vision_provider, request, [text_provider]) is vision_provider
     print(
         "AstrBot caption contract passed: disabled=0 calls; enabled current/quote branches each call once; "
-        "provider ID selects explicitly, provider object falls back to the session provider."
+        "provider selection and native current-image modality filtering are independent of caption disabling."
     )
 
 

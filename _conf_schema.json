@@ -228,7 +228,7 @@
         "description": "单次请求最多参考图片数",
         "type": "int",
         "default": 5,
-        "hint": "包含本次原生已有图片；已有图片超限时不再补图"
+        "hint": "限制插件决策附图；不裁剪原生当前附件"
       },
       "image_caption_budget": {
         "description": "每轮最多新增转述数",

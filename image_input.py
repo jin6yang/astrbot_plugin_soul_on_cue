@@ -7,7 +7,9 @@ import base64
 import inspect
 import json
 import logging
+import tempfile
 from dataclasses import dataclass, replace
+from pathlib import Path
 
 from .image_cache import CachedImage
 from .image_caption import CaptionRound, clip_description
@@ -30,21 +32,34 @@ class PreparedContext:
 async def encode_cached_image(
     cached: CachedImage, *, max_size: int = 1024, logger=None,
 ) -> EncodedImage | None:
-    """在调用方租约内生成内存预览；取消时先等工作线程退出再归还租约。"""
+    """在调用方租约内复用原生预处理；取消时等处理和清理完成再归还租约。"""
     logger = logger or logging.getLogger(__name__)
 
-    def encode() -> EncodedImage:
-        from astrbot.core.utils.media_utils import _prepare_model_image_sync
+    async def encode() -> EncodedImage | None:
+        from astrbot.core.utils.media_utils import prepare_model_image
 
-        data, montage = _prepare_model_image_sync(cached.path.read_bytes(), max_size)
-        if not data or len(data) >= 512 * 1024:
-            raise ValueError("Image preview exceeds its memory input limit")
-        mime = "image/png" if data.startswith(b"\x89PNG\r\n\x1a\n") else "image/jpeg"
-        return EncodedImage(f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}", montage)
+        with tempfile.TemporaryDirectory(prefix="oncue-image-preview-") as directory:
+            output_dir = Path(directory)
+            prepared = await prepare_model_image(
+                str(cached.path), max_size=max_size, output_dir=output_dir,
+            )
+            if prepared is None:
+                return None
+            path, montage, needs_cleanup, _original_path = prepared
+            preview = Path(path)
+            try:
+                data = await asyncio.to_thread(preview.read_bytes)
+                if not data:
+                    raise ValueError("Image preview is empty")
+                mime = "image/png" if data.startswith(b"\x89PNG\r\n\x1a\n") else "image/jpeg"
+                return EncodedImage(f"data:{mime};base64,{base64.b64encode(data).decode('ascii')}", montage)
+            finally:
+                # 原生可直接复用缓存源；只主动删除它明确交还的本次衍生文件。
+                if needs_cleanup and preview.is_relative_to(output_dir):
+                    preview.unlink(missing_ok=True)
 
-    # Unlike a cancellable to_thread Task, this protected executor Future keeps
-    # representing the actual worker lifetime while its caller is cancelled.
-    worker = asyncio.get_running_loop().run_in_executor(None, encode)
+    # 保护整个公开调用及其清理，避免取消传播到原生内部的 to_thread。
+    worker = asyncio.create_task(encode())
     try:
         return await asyncio.shield(worker)
     except asyncio.CancelledError:
@@ -59,7 +74,7 @@ async def encode_cached_image(
             worker.exception()
         raise
     except Exception as exc:
-        logger.warning(f"[OnCue][图片输入] 内存预处理失败: {type(exc).__name__}")
+        logger.warning(f"[OnCue][图片输入] 原生预处理失败: {type(exc).__name__}")
         return None
 
 

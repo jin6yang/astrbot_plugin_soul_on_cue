@@ -1385,10 +1385,8 @@ class OnCuePlugin(Star):
             include_history = self._cfg_bool("enable_context_injection", True)
             mode = self._image_mode()
             native_owned = event.get_extra("oncue_native_image_request", False)
-            native_images = list(getattr(req, "image_urls", None) or [])
             if native_owned and mode in {"placeholder", "describe"}:
                 req.image_urls = []
-                native_images = []
             budget = event.get_extra("oncue_image_round")
             if not isinstance(budget, CaptionRound) or budget.closed:
                 budget = self._new_image_round(self._chat(event.unified_msg_origin))
@@ -1400,20 +1398,11 @@ class OnCuePlugin(Star):
                 rows = (target,) if target is not None else tuple(row for row in snapshot.rows if row.record_id == current_id)
                 working = ContextSnapshot(rows, snapshot.progress, snapshot.image_note)
             if self.image_input is not None:
-                previous = getattr(req, "_oncue_image_parts", ())
-                extras = [part for part in (getattr(req, "extra_user_content_parts", ()) or ()) if not any(part is own for own in previous)]
-                extra_count = sum(1 for part in extras if (part.get("type") if isinstance(part, dict) else getattr(part, "type", None)) == "image_url")
-                skip = set()
-                if native_images:
-                    for row in working.rows:
-                        if row.record_id == event.get_extra("oncue_record_id"):
-                            skip.update(image.image_id for image in iter_images(row.parts))
                 prepared = await self._prepare_images(
                     event.unified_msg_origin, working,
-                    vision=self.image_models.reply_vision(event, req), round=budget,
+                    # 正式请求钩子未提供实际供应商，插件补充内容保留未知能力。
+                    vision=None, round=budget,
                     focus_records=(target.record_id,) if target else tuple(row.record_id for row in working.rows[-1:]),
-                    max_images=max(0, self._cfg_int("image_request_count", 5) - len(native_images) - extra_count),
-                    image_offset=extra_count, skip_direct_ids=skip,
                     message_char_limit=max(1, self._cfg_int("message_char_limit", 500)),
                     max_size=self.image_models.image_max_size(event.unified_msg_origin),
                 )

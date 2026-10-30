@@ -10,13 +10,9 @@ DEFAULT_CAPTION_PROMPT = """你为群聊图片生成可复用的客观描述，�
 使用中性、简洁的语言，不使用角色口吻，不添加评价或聊天回复。仅输出描述正文，不输出文件大小、缓存状态或[图片]外层标记。遵守本次给定的字符预算。"""
 
 
-def declared_vision(provider, model=None):
+def declared_vision(provider):
     if provider is None:
         return None
-    if model:
-        get_model = getattr(provider, "get_model", None)
-        if not callable(get_model) or model != get_model():
-            return None
     config = getattr(provider, "provider_config", {})
     modalities = config.get("modalities") if isinstance(config, dict) else None
     return "image" in modalities if isinstance(modalities, list) and modalities else None
@@ -75,20 +71,6 @@ class ImageModels:
             return None, None
         self._issues.pop("decision", None)
         return provider_id, declared_vision(provider)
-
-    def reply_vision(self, event, req):
-        # hook 没有最终 provider 参数；只认明确选择且没有后续候选的路由。
-        selected = event.get_extra("selected_provider")
-        # 原生选择器只接受提供商 ID；对象形式会被忽略，不能当作实际路由。
-        provider = self._provider(selected) if isinstance(selected, str) and selected else None
-        try:
-            config = self.context.get_config(umo=event.unified_msg_origin) if callable(getattr(self.context, "get_config", None)) else {}
-        except Exception:
-            return None
-        fallbacks = config.get("agent_runner", {}).get("config", {}).get("model", {}).get("fallback_provider_ids", [])
-        if fallbacks:
-            return None
-        return declared_vision(provider, getattr(req, "model", None))
 
     def image_max_size(self, umo):
         get_config = getattr(self.context, "get_config", None)

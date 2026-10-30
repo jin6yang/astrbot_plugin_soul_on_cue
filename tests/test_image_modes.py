@@ -129,25 +129,27 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.inject_stage_direction(event, req)
         self.assertEqual(req.image_urls, ["native-image"])
 
-    async def test_mixed_extra_image_numbering_cap_and_repeated_hook_ownership(self):
+    async def test_unknown_reply_replaces_owned_visuals_but_preserves_foreign_parts(self):
         self.plugin.config.update(image_request_count=3, image_caption_budget=0)
         older = self.event("older", summoned=False)
         await self.plugin.on_message(older)
         event = await self.approve(self.event(images=0))
         decision = event.get_extra("oncue_decision")
         decision["_target"] = decision["_chat_context"].target("older")
+        self.chat.messages[0]["parts"][1].image.description = "历史图片的已有描述"
         event.set_extra("selected_provider", "vision")
         foreign = ImageURLPart(image_url={"url": "foreign-image"})
-        req = self.request(extras=[foreign])
+        owned = ImageURLPart(image_url={"url": "previous-oncue-image"}).mark_as_temp()
+        req = self.request(extras=[foreign, owned])
+        req._oncue_image_parts = [owned]
         for _ in range(2):
             await self.plugin.inject_stage_direction(event, req)
         self.assertEqual(req.image_urls, ["native-image"])
         visuals = [part for part in req.extra_user_content_parts if getattr(part, "type", None) == "image_url"]
-        self.assertEqual(len(visuals), 2)
+        self.assertEqual(len(visuals), 1)
         self.assertIs(visuals[0], foreign)
-        self.assertTrue(visuals[1]._no_save)
-        self.assertIn("图片2", _request_text(req))
-        self.assertNotIn("图片3：", _request_text(req))
+        self.assertIn("历史图片的已有描述", _request_text(req))
+        self.assertNotIn("本次附图关联", _request_text(req))
         self.plugin.config["image_mode"] = "不转述（仅占位）"
         await self.plugin.inject_stage_direction(event, req)
         self.assertEqual([part for part in req.extra_user_content_parts if getattr(part, "type", None) == "image_url"], [foreign])
@@ -160,7 +162,6 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.inject_stage_direction(event, req)
         self.assertIn("可见的一只猫", _request_text(req))
         self.assertFalse(getattr(req, "_oncue_image_parts", []))
-        self.assertFalse(self.plugin.image_models.reply_vision(event, req))
 
     async def test_budget_is_shared_by_initial_extra_decision_and_reply(self):
         self.chat.last_reply_ts = plugin_module.time.time() - 1
@@ -305,21 +306,31 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
             warning.assert_not_called()
         self.context.llm_generate.assert_not_awaited()
 
-    async def test_provider_override_or_fallback_uncertainty_is_not_guessed(self):
-        event = self.event()
-        event.set_extra("selected_provider", "vision")
-        req = self.request()
-        self.assertTrue(self.plugin.image_models.reply_vision(event, req))
-        req.model = "another-model"
-        self.assertIsNone(self.plugin.image_models.reply_vision(event, req))
-        req.model = None
-        self.native["agent_runner"]["config"]["model"]["fallback_provider_ids"] = ["decision"]
-        self.assertIsNone(self.plugin.image_models.reply_vision(event, req))
+    async def test_provider_selection_and_fallback_config_do_not_control_reply_supplements(self):
+        self.plugin.config["image_caption_budget"] = 0
+        for index, fallbacks in enumerate(([], ["decision"])):
+            with self.subTest(fallbacks=fallbacks):
+                self.native["agent_runner"]["config"]["model"]["fallback_provider_ids"] = fallbacks
+                event = await self.approve(self.event(f"current-{index}"))
+                self.chat.messages[-1]["parts"][1].image.description = "已有描述"
+                event.set_extra("selected_provider", "vision")
+                req = self.request()
+                req.model = "another-model"
+                with patch.object(self.context, "get_provider_by_id", side_effect=AssertionError("must not infer reply provider")):
+                    await self.plugin.inject_stage_direction(event, req)
+                self.assertEqual(req.image_urls, ["native-image"])
+                self.assertEqual(req.model, "another-model")
+                self.assertFalse(req._oncue_image_parts)
+                self.assertIn("已有描述", _request_text(req))
 
     async def test_provider_object_is_not_an_explicit_native_route(self):
-        event = self.event()
+        event = await self.approve()
         event.set_extra("selected_provider", self.providers["vision"])
-        self.assertIsNone(self.plugin.image_models.reply_vision(event, self.request()))
+        req = self.request()
+        await self.plugin.inject_stage_direction(event, req)
+        self.assertIn("可见的一只猫", _request_text(req))
+        self.assertFalse(req._oncue_image_parts)
+        self.assertEqual(req.image_urls, ["native-image"])
 
     async def test_cancelling_reply_image_wait_releases_only_owned_reservation(self):
         self.plugin.config["image_mode"] = "仅转述"
