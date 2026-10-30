@@ -168,7 +168,7 @@ class DecisionCardTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_card_does_not_consume_glance_activity_or_start_generation(self):
         self.personas.clear()
         _native_pipeline(self.plugin)
-        self.plugin._glance_interval_seconds = lambda: 900
+        self.plugin._glance_interval_seconds = lambda chat=None: 900
         self.plugin._append_message(self.chat, self.plugin._event_to_item(self.event))
         self.plugin.glance_last_check[self.event.unified_msg_origin] = 0
         with self.assertLogs(plugin_module.logger, level="ERROR"):

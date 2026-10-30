@@ -17,6 +17,7 @@ from astrbot.core.agent.message import ImageURLPart, TextPart
 from astrbot.core.message.components import At, Image, Plain, Reply
 from astrbot.core.message.message_event_result import ResultContentType
 
+from .attention import ATTENTION_NOTE_LIMIT, AttentionState
 from .context_injection import add_stage_direction, request_background, set_temporary_background
 from .image_cache import CacheLimits, SessionImageCache
 from .image_caption import CaptionRound, ImageCaptionService
@@ -26,6 +27,14 @@ from .message_context import ContextRow, ContextSnapshot, ImageReference, Messag
 
 
 MESSAGE_CACHE_LIMIT = 300
+GLANCE_CONCURRENCY = 2
+
+ATTENTION_DECISION_RULE = (
+    "临时关注与本次是否回复独立，只影响之后的一瞥间隔。"
+    "如需关注，在同一个 JSON 中给出 attention_action（start 开启、keep 保持、stop 结束、restart 重启）"
+    "和 attention_note（简短说明关注什么）。start/restart 必须有说明；"
+    "keep 不重置消息计数或计时，缺省为 keep；不自行指定时间，不因关注而强制回复。"
+)
 
 
 DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请代入以下角色，判断看到群聊对话后是否想开口。
@@ -38,9 +47,10 @@ DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请�
 5. 有任何犹豫 → 保持安静
 6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空
 7. 需要回应某条消息时，target_message_id 填本次记录中的消息ID（缺失时用内部ID），可选择较早的消息；自然接话可留空，不填写记录之外的ID
+8. 是否继续关注话题与本次是否回复独立；需要时说明关注事项，不因关注而强制开口
 
 只输出 JSON，不要输出其它内容：
-{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由", "need_kb": true或false, "kb_query": "需要时填独立检索词", "target_message_id": "回应目标的消息ID或内部ID，可留空"}
+{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由", "need_kb": true或false, "kb_query": "需要时填独立检索词", "target_message_id": "回应目标的消息ID或内部ID，可留空", "attention_action": "start/keep/stop/restart", "attention_note": "关注事项，可留空"}
 
 <角色设定>
 {character_card}
@@ -83,6 +93,7 @@ class ChatFacts:
     last_activity_ts: float = 0.0
     last_observation_activity_ts: float = 0.0
     cooldown_until: float = 0.0
+    attention: AttentionState = field(default_factory=AttentionState)
 
 
 class OnCuePlugin(Star):
@@ -95,6 +106,7 @@ class OnCuePlugin(Star):
         self.glance_next_due: dict[str, float] = {}
         self.glance_last_check: dict[str, int] = {}  # 最近有效一瞥决策所见的消息序号
         self.glance_task: asyncio.Task | None = None
+        self._glance_jobs: dict[str, asyncio.Task] = {}
         self._decision_card_issue: str | None = None
         self.kb_missing_warned = False
         self.kb_not_taken_warned = False
@@ -145,6 +157,12 @@ class OnCuePlugin(Star):
             except asyncio.CancelledError:
                 pass
             self.glance_task = None
+        glance_jobs = list(self._glance_jobs.values())
+        for task in glance_jobs:
+            task.cancel()
+        if glance_jobs:
+            await asyncio.gather(*glance_jobs, return_exceptions=True)
+        self._glance_jobs.clear()
         if self.image_cache:
             if self.image_captions:
                 await self.image_captions.close()
@@ -345,23 +363,60 @@ class OnCuePlugin(Star):
         except Exception as e:
             logger.error(f"[OnCue] 写入 GLANCE 持久化失败: {e}")
 
-    def _glance_interval_seconds(self) -> float:
-        minutes_min = self._cfg_int("glance_min_minutes", 15)
-        minutes_max = self._cfg_int("glance_max_minutes", 40)
+    def _glance_interval_seconds(self, chat: ChatFacts | None = None) -> float:
+        focused = chat is not None and chat.attention.active
+        prefix = "attention_glance" if focused else "glance"
+        default_min, default_max = (3, 8) if focused else (15, 35)
+        minutes_min = self._cfg_int(f"{prefix}_min_minutes", default_min)
+        minutes_max = self._cfg_int(f"{prefix}_max_minutes", default_max)
         if minutes_min <= 0:
-            minutes_min = 15
+            minutes_min = default_min
         if minutes_max <= 0:
-            minutes_max = 40
+            minutes_max = default_max
         if minutes_min > minutes_max:
             minutes_min, minutes_max = minutes_max, minutes_min
         return random.uniform(minutes_min, minutes_max) * 60.0
 
     def _schedule_glance(self, chat_id: str, base_ts: float, min_ts: float = 0.0) -> None:
-        due = base_ts + self._glance_interval_seconds()
+        due = base_ts + self._glance_interval_seconds(self.chats.get(chat_id))
         if min_ts > 0:
             due = max(due, min_ts)
         self.glance_next_due[chat_id] = due
         self._save_glance()
+
+    def _refresh_attention(self, chat_id: str, chat: ChatFacts, now: float) -> None:
+        """持有会话锁；到期只更新插件状态，不调用模型或改变观测期。"""
+        enabled = self._cfg_bool("enable", True) and self._cfg_bool("enable_glance", False)
+        if chat.attention.expire(now, chat.incoming_seq):
+            logger.info(f"[OnCue][临时关注] 已强制退出: {chat_id} | {chat.attention.notice.reason}")
+            if enabled:
+                self._schedule_glance(chat_id, now)
+        if not enabled and chat.attention.active:
+            chat.attention.apply("stop", "", "", now, chat.incoming_seq, expected_revision=chat.attention.revision)
+
+    def _commit_attention(self, chat_id, chat, decision, view, snapshot, now):
+        """仅提交当前有效的最终决策；过期关注的旧结果不恢复状态。"""
+        if not decision["_valid"]:
+            return
+        if view.notice is not None:
+            chat.attention.acknowledge(view.notice.token)
+        if not self._cfg_bool("enable_glance", False):
+            return
+        action = decision["attention_action"]
+        source = None
+        if action == "restart" or (action == "start" and not chat.attention.active):
+            source = decision.get("_target") or next((row for row in reversed(snapshot.rows) if row.role == "user"), None)
+        message_id = (source.message_id or source.record_id) if source else ""
+        result = chat.attention.apply(
+            action, decision["attention_note"], message_id, now, chat.incoming_seq,
+            expected_revision=view.revision,
+        )
+        if result in {"started", "restarted"}:
+            due = now + self._glance_interval_seconds(chat)
+            self.glance_next_due[chat_id] = min(self.glance_next_due.get(chat_id, due), due)
+            self._save_glance()
+        elif result == "stopped":
+            self._schedule_glance(chat_id, now)
 
     def _ensure_glance_schedule(self, chat_id: str, now: float) -> None:
         if not self._cfg_bool("enable_glance", False):
@@ -374,16 +429,40 @@ class OnCuePlugin(Star):
     async def _glance_loop(self) -> None:
         while True:
             await asyncio.sleep(15)
-            if not self._cfg_bool("enable", True) or not self._cfg_bool("enable_glance", False):
+            await self._glance_tick()
+
+    async def _glance_tick(self) -> None:
+        now = time.time()
+        for chat_id, chat in list(self.chats.items()):
+            async with chat.lock:
+                self._refresh_attention(chat_id, chat, now)
+        if self._terminating or not self._cfg_bool("enable", True) or not self._cfg_bool("enable_glance", False):
+            return
+        # 至多两个会话同时运行，按已排定的时间先后领取空位；不在轮询中等待模型。
+        for chat_id, due in sorted(self.glance_next_due.items(), key=lambda item: item[1]):
+            if len(self._glance_jobs) >= GLANCE_CONCURRENCY or due > now:
+                break
+            if chat_id in self._glance_jobs:
                 continue
-            now = time.time()
-            due_chats = [chat_id for chat_id, ts in self.glance_next_due.items() if ts <= now]
-            for chat_id in due_chats:
-                try:
-                    await self._glance_due(chat_id)
-                except Exception as e:
-                    logger.error(f"[OnCue] GLANCE 执行失败 {chat_id}: {e}")
-                    self._schedule_glance(chat_id, time.time())
+            chat = self._chat(chat_id)
+            async with chat.lock:
+                if chat.glance_inflight or chat.decision_inflight or chat.message_wait is not None:
+                    continue
+            task = asyncio.create_task(self._glance_job(chat_id))
+            self._glance_jobs[chat_id] = task
+            task.add_done_callback(lambda completed, key=chat_id: self._finish_glance_job(key, completed))
+
+    def _finish_glance_job(self, chat_id: str, task: asyncio.Task) -> None:
+        # 协程首次运行前也可能被取消，不能只依赖它自身的 finally。
+        if self._glance_jobs.get(chat_id) is task:
+            self._glance_jobs.pop(chat_id, None)
+
+    async def _glance_job(self, chat_id: str) -> None:
+        try:
+            await self._glance_due(chat_id)
+        except Exception as exc:
+            logger.error(f"[OnCue] GLANCE 执行失败 {chat_id}: {exc}")
+            self._schedule_glance(chat_id, time.time())
 
     def _create_glance_event(self, chat: ChatFacts):
         if chat.glance_target is None:
@@ -413,6 +492,7 @@ class OnCuePlugin(Star):
     async def _glance_due(self, chat_id: str) -> None:
         chat = self._chat(chat_id)
         async with chat.lock:
+            self._refresh_attention(chat_id, chat, time.time())
             if chat.glance_inflight:
                 return
             chat.glance_inflight = True
@@ -861,6 +941,8 @@ class OnCuePlugin(Star):
             need_kb = str(need_kb).strip().lower() in {"true", "1", "yes", "y"}
         target = data.get("target_message_id")
         target_valid = target is None or (isinstance(target, (str, int)) and not isinstance(target, bool))
+        attention_action = data.get("attention_action", "keep")
+        attention_note = data.get("attention_note", "")
         decision = {
             "_valid": valid and target_valid,
             "should_reply": should_reply and target_valid,
@@ -870,6 +952,8 @@ class OnCuePlugin(Star):
             "need_kb": need_kb,
             "kb_query": str(data.get("kb_query", "") or "").strip(),
             "target_message_id": str(target).strip() if target is not None and target_valid else "",
+            "attention_action": attention_action.strip().lower() if isinstance(attention_action, str) else "",
+            "attention_note": attention_note.strip()[:ATTENTION_NOTE_LIMIT] if isinstance(attention_note, str) else "",
         }
         if decision["need_kb"] and not decision["kb_query"]:
             decision["need_kb"] = False
@@ -944,6 +1028,7 @@ class OnCuePlugin(Star):
         summoned = summoned_version is not None
         async with chat.lock:
             now = time.time()
+            self._refresh_attention(event.unified_msg_origin, chat, now)
             if self._terminating or not self._cfg_bool("enable", True):
                 return False
             if summoned and chat.reply_version != summoned_version:
@@ -997,6 +1082,13 @@ class OnCuePlugin(Star):
 
         try:
             for attempt in range(2):
+                async with chat.lock:
+                    now = time.time()
+                    self._refresh_attention(event.unified_msg_origin, chat, now)
+                    if not current(now) or (attempt and not self._cfg_bool("enable_extra_decision", True)):
+                        return False
+                    attention_view = chat.attention.snapshot()
+                    attention_context = attention_view.render(now, snapshot.progress)
                 if self.image_input is not None and any(any(iter_images(row.parts)) for row in snapshot.rows):
                     if await self._decision_card() is None:
                         return False
@@ -1004,6 +1096,10 @@ class OnCuePlugin(Star):
                 prompt = await self._build_prompt(snapshot.render(), entry_context)
                 if prompt is None:
                     return False
+                if self._cfg_bool("enable_glance", False):
+                    prompt += "\n\n" + ATTENTION_DECISION_RULE + "\n" + (attention_context or "[临时关注] 当前未开启，采用普通一瞥间隔。")
+                elif attention_context:
+                    prompt += "\n\n" + attention_context + "\n定时一瞥当前已关闭，不安排后续关注检查。"
                 async with chat.lock:
                     if not current(time.time()) or (attempt and not self._cfg_bool("enable_extra_decision", True)):
                         return False
@@ -1044,9 +1140,11 @@ class OnCuePlugin(Star):
                 decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
             async with chat.lock:
                 now = time.time()
+                self._refresh_attention(event.unified_msg_origin, chat, now)
                 if not current(now):
                     logger.info(f"[OnCue] 会话状态已变化，忽略本次决策: source={source}")
                     return False
+                self._commit_attention(event.unified_msg_origin, chat, decision, attention_view, snapshot, now)
                 if backoff_key == "glance" and decision["_valid"]:
                     self.glance_last_check[event.unified_msg_origin] = snapshot.progress
                 if decision["should_reply"]:
@@ -1165,6 +1263,7 @@ class OnCuePlugin(Star):
             if not self._append_message(chat, item):
                 event.stop_event()
                 return
+            self._refresh_attention(event.unified_msg_origin, chat, now)
             if self._cfg_bool("enable_glance", False):
                 # 仅保存路由信息，不持有入站事件、原消息或媒体临时文件。
                 chat.glance_target = {

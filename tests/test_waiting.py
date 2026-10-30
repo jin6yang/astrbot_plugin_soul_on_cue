@@ -28,7 +28,7 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         self.chat.last_reply_ts = self.now - 1
         self.plugin._decision_card = AsyncMock(return_value="角色卡")
         self.plugin._llm_decision = AsyncMock(return_value=POSITIVE)
-        self.plugin._glance_interval_seconds = lambda: 900.0
+        self.plugin._glance_interval_seconds = lambda chat=None: 900.0
         self.tasks = []
 
     async def asyncTearDown(self):

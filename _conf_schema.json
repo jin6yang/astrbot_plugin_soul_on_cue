@@ -88,7 +88,7 @@
       "decision_prompt": {
         "description": "决策提示词（高级）",
         "type": "text",
-        "default": "你是群聊角色扮演机器人的\"内心\"。请代入以下角色，判断看到群聊对话后是否想开口。\n\n判断原则（按优先级）：\n1. 有人明确@或点名你、或直接向你提问 → 优先考虑回应，仍可根据角色和语境保持沉默\n2. 话题命中角色的兴趣或专业领域、有人需要帮助、气氛需要打圆场 → 可以开口\n3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静\n4. 只有内容未读取的图片占位，且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静；已提供图片或描述时，结合实际内容判断\n5. 有任何犹豫 → 保持安静\n6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空\n7. 需要回应某条消息时，target_message_id 填本次记录中的消息ID（缺失时用内部ID），可选择较早的消息；自然接话可留空，不填写记录之外的ID\n\n只输出 JSON，不要输出其它内容：\n{\"should_reply\": true或false, \"speaker\": \"回应的角色名(单角色填角色名)\", \"mood\": \"当前心情短语\", \"reason\": \"一句话理由\", \"need_kb\": true或false, \"kb_query\": \"需要时填独立检索词\", \"target_message_id\": \"回应目标的消息ID或内部ID，可留空\"}\n\n<角色设定>\n{character_card}\n</角色设定>\n\n<群聊近况>\n{chat_history}\n</群聊近况>\n\n当前时间：{current_time}\n\n<触发背景>\n{entry_context}\n</触发背景>",
+        "default": "你是群聊角色扮演机器人的\"内心\"。请代入以下角色，判断看到群聊对话后是否想开口。\n\n判断原则（按优先级）：\n1. 有人明确@或点名你、或直接向你提问 → 优先考虑回应，仍可根据角色和语境保持沉默\n2. 话题命中角色的兴趣或专业领域、有人需要帮助、气氛需要打圆场 → 可以开口\n3. 群友之间的闲聊与角色无关、刚说过话没有新信息、深夜角色在睡觉 → 保持安静\n4. 只有内容未读取的图片占位，且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静；已提供图片或描述时，结合实际内容判断\n5. 有任何犹豫 → 保持安静\n6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空\n7. 需要回应某条消息时，target_message_id 填本次记录中的消息ID（缺失时用内部ID），可选择较早的消息；自然接话可留空，不填写记录之外的ID\n8. 是否继续关注话题与本次是否回复独立；需要时说明关注事项，不因关注而强制开口\n\n只输出 JSON，不要输出其它内容：\n{\"should_reply\": true或false, \"speaker\": \"回应的角色名(单角色填角色名)\", \"mood\": \"当前心情短语\", \"reason\": \"一句话理由\", \"need_kb\": true或false, \"kb_query\": \"需要时填独立检索词\", \"target_message_id\": \"回应目标的消息ID或内部ID，可留空\", \"attention_action\": \"start/keep/stop/restart\", \"attention_note\": \"关注事项，可留空\"}\n\n<角色设定>\n{character_card}\n</角色设定>\n\n<群聊近况>\n{chat_history}\n</群聊近况>\n\n当前时间：{current_time}\n\n<触发背景>\n{entry_context}\n</触发背景>",
         "hint": "可用变量: {character_card} {current_time} {entry_context} {chat_history}"
       }
     }
@@ -158,6 +158,17 @@
         "description": "一瞥最大间隔（分）",
         "type": "int",
         "default": 35
+      },
+      "attention_glance_min_minutes": {
+        "description": "临时关注最小间隔（分）",
+        "type": "int",
+        "default": 3,
+        "hint": "模型选择关注后使用；需开启定时一瞥"
+      },
+      "attention_glance_max_minutes": {
+        "description": "临时关注最大间隔（分）",
+        "type": "int",
+        "default": 8
       }
     }
   },

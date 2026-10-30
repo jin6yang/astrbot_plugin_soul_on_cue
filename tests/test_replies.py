@@ -24,7 +24,7 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._build_prompt = AsyncMock(return_value="prompt")
         self.plugin._llm_decision = AsyncMock(return_value='{"should_reply": true, "reason": "topic"}')
         _native_pipeline(self.plugin, "glance reply")
-        self.plugin._glance_interval_seconds = lambda: 900.0
+        self.plugin._glance_interval_seconds = lambda chat=None: 900.0
 
     async def decide(self):
         return await self.plugin._decide(self.event, self.chat, "observe", None)

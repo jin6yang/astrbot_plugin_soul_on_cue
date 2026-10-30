@@ -30,7 +30,7 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._build_prompt = AsyncMock(return_value="prompt")
         self.plugin._llm_decision = AsyncMock(return_value='{"should_reply": false}')
         _native_pipeline(self.plugin)
-        self.plugin._glance_interval_seconds = lambda: 900.0
+        self.plugin._glance_interval_seconds = lambda chat=None: 900.0
 
     async def assert_skipped_activity_is_checked_next_time(self):
         await self.plugin._glance_due(self.chat_id)

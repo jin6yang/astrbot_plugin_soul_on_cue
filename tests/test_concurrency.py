@@ -37,7 +37,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._llm_decision = AsyncMock(return_value=SILENT)
         self.plugin._kb_retrieve = AsyncMock(return_value="knowledge")
         _native_pipeline(self.plugin, "glance reply")
-        self.plugin._glance_interval_seconds = lambda: 900.0
+        self.plugin._glance_interval_seconds = lambda chat=None: 900.0
         self.tasks = []
 
     async def asyncTearDown(self):
