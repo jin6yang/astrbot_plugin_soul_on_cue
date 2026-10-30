@@ -169,11 +169,11 @@ class DecisionCardTests(unittest.IsolatedAsyncioTestCase):
         self.personas.clear()
         _native_pipeline(self.plugin)
         self.plugin._glance_interval_seconds = lambda: 900
-        self.chat.last_activity_ts = 950
-        self.plugin.glance_last_check[self.event.unified_msg_origin] = 900
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(self.event))
+        self.plugin.glance_last_check[self.event.unified_msg_origin] = 0
         with self.assertLogs(plugin_module.logger, level="ERROR"):
             await self.plugin._glance_due(self.event.unified_msg_origin)
-        self.assertEqual(self.plugin.glance_last_check[self.event.unified_msg_origin], 900)
+        self.assertEqual(self.plugin.glance_last_check[self.event.unified_msg_origin], 0)
         self.plugin._run_native_reply.assert_not_awaited()
         self.assertFalse(self.chat.glance_inflight)
         self.assert_no_decision_effects()

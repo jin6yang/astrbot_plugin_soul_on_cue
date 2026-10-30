@@ -16,6 +16,13 @@ class ContextRow:
 @dataclass(frozen=True)
 class ContextSnapshot:
     rows: tuple[ContextRow, ...]
+    progress: int = 0
+
+    def target(self, message_id: str) -> ContextRow | None:
+        return next((
+            row for row in self.rows
+            if row.role == "user" and (row.message_id or row.record_id) == message_id
+        ), None)
 
     def render(
         self, *, body_overrides: dict[str, str] | None = None,

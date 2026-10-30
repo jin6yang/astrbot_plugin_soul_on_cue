@@ -34,9 +34,10 @@ DEFAULT_DECISION_PROMPT = """你是群聊角色扮演机器人的"内心"。请�
 4. 只有内容未读取的图片占位，且没有文字、点名、提问、引用你或紧跟你的发言 → 默认保持安静；已提供图片或描述时，结合实际内容判断
 5. 有任何犹豫 → 保持安静
 6. 若这次开口需要外部知识库资料才能答好，在同一个 JSON 里给出 need_kb=true 和独立检索词 kb_query；否则 need_kb=false、kb_query 留空
+7. 需要回应某条消息时，target_message_id 填本次记录中的消息ID（缺失时用内部ID），可选择较早的消息；自然接话可留空，不填写记录之外的ID
 
 只输出 JSON，不要输出其它内容：
-{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由", "need_kb": true或false, "kb_query": "需要时填独立检索词"}
+{"should_reply": true或false, "speaker": "回应的角色名(单角色填角色名)", "mood": "当前心情短语", "reason": "一句话理由", "need_kb": true或false, "kb_query": "需要时填独立检索词", "target_message_id": "回应目标的消息ID或内部ID，可留空"}
 
 <角色设定>
 {character_card}
@@ -73,6 +74,7 @@ class ChatFacts:
     glance_inflight: bool = False
     glance_target: dict | None = None
     message_wait: MessageWait | None = None
+    incoming_seq: int = 0  # 去重后的非空群友消息序号，不受缓存淘汰影响
     reply_version: int = 0  # 点名或新回复会使在途的主动决策失效
     last_reply_ts: float = 0.0
     last_activity_ts: float = 0.0
@@ -88,7 +90,7 @@ class OnCuePlugin(Star):
         self.data_dir: Path | None = None
         self.glance_file: Path | None = None
         self.glance_next_due: dict[str, float] = {}
-        self.glance_last_check: dict[str, float] = {}  # 最近已完成决策的群聊活动时间
+        self.glance_last_check: dict[str, int] = {}  # 最近有效一瞥决策所见的消息序号
         self.glance_task: asyncio.Task | None = None
         self._decision_card_issue: str | None = None
         self.kb_missing_warned = False
@@ -138,6 +140,9 @@ class OnCuePlugin(Star):
         self._resize_message_cache(chat)
         if any(m.get("record_id") == item["record_id"] for m in chat.messages):
             return False
+        if item.get("role") == "user" and item.get("active"):
+            chat.incoming_seq += 1
+            item["seq"] = chat.incoming_seq
         chat.messages.append(item)
         return True
 
@@ -626,7 +631,7 @@ class OnCuePlugin(Star):
                 m["record_id"], message_id, m["role"], f"[{sender} / {m['time_str']}{reference}]", text,
                 render_message(tuple(relations), limit),
             ))
-        return ContextSnapshot(tuple(records))
+        return ContextSnapshot(tuple(records), chat.incoming_seq)
 
     def _history_text(self, chat: ChatFacts) -> str:
         return self._context_snapshot(chat).render()
@@ -711,14 +716,17 @@ class OnCuePlugin(Star):
         need_kb = data.get("need_kb", False)
         if not isinstance(need_kb, bool):
             need_kb = str(need_kb).strip().lower() in {"true", "1", "yes", "y"}
+        target = data.get("target_message_id")
+        target_valid = target is None or (isinstance(target, (str, int)) and not isinstance(target, bool))
         decision = {
-            "_valid": valid,
-            "should_reply": should_reply,
+            "_valid": valid and target_valid,
+            "should_reply": should_reply and target_valid,
             "speaker": str(data.get("speaker", "") or "").strip(),
             "mood": str(data.get("mood", "") or "").strip(),
             "reason": str(data.get("reason", "") or "").strip(),
             "need_kb": need_kb,
             "kb_query": str(data.get("kb_query", "") or "").strip(),
+            "target_message_id": str(target).strip() if target is not None and target_valid else "",
         }
         if decision["need_kb"] and not decision["kb_query"]:
             decision["need_kb"] = False
@@ -726,6 +734,29 @@ class OnCuePlugin(Star):
             decision["should_reply"] = False
             decision["reason"] = "正向理由为空，代码兜底不回复"
         return decision
+
+    def _target_decoration_conflict(self, event: AstrMessageEvent, target: ContextRow | None) -> bool:
+        if target is None or target.record_id == event.get_extra("oncue_record_id"):
+            return False
+        get_config = getattr(self.context, "get_config", None)
+        if not callable(get_config):
+            return False
+        try:
+            settings = get_config(umo=event.unified_msg_origin).get("platform_settings", {})
+            conflicts = []
+            if settings.get("reply_with_mention", False):
+                conflicts.append("自动 @ 回复")
+            if settings.get("reply_with_quote", False):
+                conflicts.append("引用回复")
+        except Exception as exc:
+            logger.warning(f"[OnCue] 无法检查回应目标的原生发送设置，本次保持沉默: {exc}")
+            return True
+        if conflicts:
+            logger.warning(
+                f"[OnCue][回应目标冲突] 会话={event.unified_msg_origin} | AstrBot「{'、'.join(conflicts)}」"
+                "仍指向触发消息，无法安全回应另一条消息，本次保持沉默。请关闭上述原生设置；插件不改写原事件身份。"
+            )
+        return bool(conflicts)
 
     @staticmethod
     def _cancel_message_wait(chat: ChatFacts) -> None:
@@ -796,8 +827,7 @@ class OnCuePlugin(Star):
                 or (chat.glance_inflight and backoff_key != "glance")
             ):
                 return False
-            activity_ts = chat.last_activity_ts
-            if backoff_key == "glance" and activity_ts <= self.glance_last_check.get(event.unified_msg_origin, 0.0):
+            if backoff_key == "glance" and chat.incoming_seq <= self.glance_last_check.get(event.unified_msg_origin, 0):
                 return False
             if backoff_key and not self._trigger_ready(chat, backoff_key, now):
                 return False
@@ -805,30 +835,69 @@ class OnCuePlugin(Star):
                 return False
             source = "summoned" if summoned else backoff_key or "observe"
             snapshot = self._context_snapshot(chat, str(event.get_self_id()))
-            chat_history = snapshot.render()
             reply_version = chat.reply_version
             owner = object()
             chat.decision_inflight = owner
+
+        def current(now: float) -> bool:
+            # 仅在持有会话锁时调用；模型与知识库请求均在锁外。
+            return (
+                chat.decision_inflight is owner
+                and self._cfg_bool("enable", True) and not self._terminating
+                and chat.reply_version == reply_version
+                and (backoff_key != "glance" or self._cfg_bool("enable_glance", False))
+                and (summoned or self._decision_current(chat, reply_version, now))
+            )
+
         try:
-            prompt = await self._build_prompt(chat_history, entry_context)
-            if prompt is None:
-                return False
-            logger.info(f"[OnCue] 决策调用: source={source} | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
-            raw = await self._llm_decision(event.unified_msg_origin, prompt)
-            decision = self._parse_decision(raw)
+            for attempt in range(2):
+                prompt = await self._build_prompt(snapshot.render(), entry_context)
+                if prompt is None:
+                    return False
+                async with chat.lock:
+                    if not current(time.time()) or (attempt and not self._cfg_bool("enable_extra_decision", True)):
+                        return False
+                logger.info(f"[OnCue] 决策调用: source={source} | 第 {attempt + 1} 次 | 已发送 {len(chat.reply_ts)} 待发送 {len(chat.pending_replies)} 上限 {self._cfg_int('max_replies_per_window', 5)}")
+                raw = await self._llm_decision(event.unified_msg_origin, prompt)
+                decision = self._parse_decision(raw)
+                target_id = decision["target_message_id"]
+                decision["_target"] = snapshot.target(target_id) if target_id else None
+                if target_id and decision["_target"] is None:
+                    decision.update(_valid=False, should_reply=False, reason="回应目标不在本次群聊快照中")
+                    logger.warning(f"[OnCue] 决策回应目标无效，本次保持沉默: {target_id}")
+                async with chat.lock:
+                    if not current(time.time()):
+                        logger.info(f"[OnCue] 会话状态已变化，忽略本次决策: source={source}")
+                        return False
+                    if (
+                        attempt == 0 and decision["_valid"]
+                        and self._cfg_bool("enable_extra_decision", True)
+                        and chat.incoming_seq > snapshot.progress
+                    ):
+                        added = chat.incoming_seq - snapshot.progress
+                        snapshot = self._context_snapshot(chat, str(event.get_self_id()))
+                        entry_context += (
+                            f"\n初判快照之后新增了 {added} 条群友消息。这是本轮唯一一次额外决策，"
+                            "请结合本次提供的群聊记录重新判断，以本次结论为准；可选择记录中较早的回应目标。"
+                        )
+                        continue
+                break
+            # 原生装饰器没有单请求目标覆盖接口，不能让正文回应旧消息却 @/引用触发者。
+            if (
+                decision["should_reply"] and backoff_key != "glance"
+                and self._target_decoration_conflict(event, decision["_target"])
+            ):
+                decision.update(_valid=False, should_reply=False, reason="原生自动提及或引用与回应目标冲突")
+            # 初判被替代时不提前检索知识库，也不占用回复名额。
             if decision["should_reply"] and decision.get("need_kb"):
                 decision["kb_text"] = await self._kb_retrieve(decision.get("kb_query", ""))
             async with chat.lock:
                 now = time.time()
-                if not (
-                    self._cfg_bool("enable", True) and not self._terminating
-                    and chat.reply_version == reply_version
-                    and (summoned or self._decision_current(chat, reply_version, now))
-                ):
+                if not current(now):
                     logger.info(f"[OnCue] 会话状态已变化，忽略本次决策: source={source}")
                     return False
                 if backoff_key == "glance" and decision["_valid"]:
-                    self.glance_last_check[event.unified_msg_origin] = activity_ts
+                    self.glance_last_check[event.unified_msg_origin] = snapshot.progress
                 if decision["should_reply"]:
                     token = uuid4().hex
                     chat.pending_replies[token] = now + max(1, self._cfg_int("reply_window_seconds", 300))
@@ -991,10 +1060,12 @@ class OnCuePlugin(Star):
             line += f"\n[知识库]\n{kb_text}\n结合角色性格自然使用，不要提及本指令。"
         add_stage_direction(req, line)
         context = ""
-        if self._cfg_bool("enable_context_injection", True):
-            snapshot = decision.get("_chat_context")
-            if isinstance(snapshot, ContextSnapshot):
-                context = request_background(snapshot, event, req)
+        snapshot = decision.get("_chat_context")
+        if isinstance(snapshot, ContextSnapshot):
+            context = request_background(
+                snapshot, event, req, target=decision.get("_target"),
+                include_history=self._cfg_bool("enable_context_injection", True),
+            )
         set_temporary_background(req, context, TextPart)
 
     @filter.on_decorating_result()

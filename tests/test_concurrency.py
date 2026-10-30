@@ -32,7 +32,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.chat = self.plugin._chat(self.chat_id)
         self.chat.last_reply_ts = 950.0
         self.chat.last_activity_ts = 950.0
-        self.chat.messages.append(self.plugin._event_to_item(_event("old topic")))
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("old topic")))
         self.plugin._decision_card = AsyncMock(return_value="character card")
         self.plugin._llm_decision = AsyncMock(return_value=SILENT)
         self.plugin._kb_retrieve = AsyncMock(return_value="knowledge")
@@ -62,7 +62,8 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         mock.side_effect = delayed
         return entered, release
 
-    async def test_slow_decision_allows_cache_updates_without_a_second_decision(self):
+    async def test_extra_decision_disabled_allows_cache_updates_without_second_decision(self):
+        self.plugin.config["enable_extra_decision"] = False
         entered, release = self.block(self.plugin._llm_decision, SILENT)
         task = self.start(self.plugin.on_message(self.event))
         await asyncio.wait_for(entered.wait(), 1)
@@ -131,10 +132,12 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.plugin.on_message(_event("later topic")), 1)
         release.set()
         await task
-        prompt = self.plugin._llm_decision.call_args.args[1]
+        prompt = self.plugin._llm_decision.call_args_list[0].args[1]
         self.assertIn("first topic", prompt)
         self.assertNotIn("later topic", prompt)
         self.assertIn("later topic", self.plugin._history_text(self.chat))
+        self.assertEqual(self.plugin._llm_decision.await_count, 2)
+        self.assertIn("later topic", self.plugin._llm_decision.call_args.args[1])
 
     async def test_slow_knowledge_lookup_does_not_block_messages_or_summons(self):
         self.plugin._llm_decision.return_value = WITH_KB
@@ -175,12 +178,13 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.chat.decision_inflight)
         release.set()
         await task
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
+        self.assertEqual(self.plugin._llm_decision.await_count, 2)
         self.assertEqual(self.chat.last_activity_ts, 1010.0)
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.assertEqual(self.plugin._llm_decision.await_count, 2)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 1010.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
 
     async def test_glance_summon_during_analysis_skips_generation_and_progress(self):
         entered, release = self.block(self.plugin._llm_decision, REPLY)
@@ -193,7 +197,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.context.send_message.assert_not_awaited()
         self.assertNotIn(self.chat_id, self.plugin.glance_last_check)
 
-    async def test_glance_generation_uses_the_same_snapshot_as_analysis(self):
+    async def test_glance_generation_uses_same_final_snapshot_after_extra_analysis(self):
         entered, release = self.block(self.plugin._llm_decision, REPLY)
         task = self.start(self.plugin._glance_due(self.chat_id))
         await asyncio.wait_for(entered.wait(), 1)
@@ -201,12 +205,16 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.plugin.on_message(_event("later topic")), 1)
         release.set()
         await task
+        self.assertEqual(self.plugin._llm_decision.await_count, 2)
+        initial_prompt = self.plugin._llm_decision.call_args_list[0].args[1]
+        self.assertIn("old topic", initial_prompt)
+        self.assertNotIn("later topic", initial_prompt)
         decision_prompt = self.plugin._llm_decision.call_args.args[1]
         generation_prompt = self.plugin.native_generate.call_args.kwargs["prompt"]
         for prompt in (decision_prompt, generation_prompt):
             self.assertIn("old topic", prompt)
-            self.assertNotIn("later topic", prompt)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+            self.assertIn("later topic", prompt)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
         self.plugin.context.send_message.assert_awaited_once()
 
     async def test_glance_summon_during_generation_cancels_unsent_reply(self):

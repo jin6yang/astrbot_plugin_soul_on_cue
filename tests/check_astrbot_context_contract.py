@@ -74,9 +74,11 @@ async def check_contract(message_models: ModuleType, provider_request) -> None:
     old_event.get_sender_id = lambda: "other-member"
     plugin._append_message(chat, plugin._event_to_item(old_event, chat))
     plugin._append_message(chat, plugin._event_to_item(event, chat))
+    snapshot = plugin._context_snapshot(chat)
     event.set_extra("oncue_decision", {
         "should_reply": True,
-        "_chat_context": plugin._context_snapshot(chat),
+        "_chat_context": snapshot,
+        "_target": snapshot.target("contract-history"),
     })
     history = [{"role": "user", "content": "EXISTING_NATIVE_HISTORY"}]
     request = provider_request(
@@ -96,6 +98,7 @@ async def check_contract(message_models: ModuleType, provider_request) -> None:
 
     assembled = await request.assemble_context()
     assert "BACKGROUND_CONTRACT_MARKER" in json.dumps(assembled)
+    assert "[本次回应目标]" in json.dumps(assembled, ensure_ascii=False)
     current_message = message_models.Message.model_validate(assembled)
     assert any(
         getattr(part, "_no_save", False) and "BACKGROUND_CONTRACT_MARKER" in getattr(part, "text", "")
@@ -107,6 +110,7 @@ async def check_contract(message_models: ModuleType, provider_request) -> None:
     saved = message_models.dump_messages_with_checkpoints(messages)
     saved_json = json.dumps(saved)
     assert "BACKGROUND_CONTRACT_MARKER" not in saved_json, "Temporary background leaked into history"
+    assert "[本次回应目标]" not in json.dumps(saved, ensure_ascii=False), "Reply target leaked into history"
     assert "ORIGINAL_CURRENT_MESSAGE" in saved_json, "Original user message must remain persisted"
     assert "EXISTING_NATIVE_HISTORY" in saved_json, "Existing history must remain persisted"
     assert saved[-1] == {"role": "assistant", "content": "REPLY"}

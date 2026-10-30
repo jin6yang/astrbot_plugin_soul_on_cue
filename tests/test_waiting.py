@@ -329,7 +329,8 @@ class WaitingTests(unittest.IsolatedAsyncioTestCase):
         await self.finish(first)
         self.assertEqual(self.plugin._llm_decision.await_count, 2)
 
-    async def test_messages_during_model_call_are_cached_without_automatic_followup(self):
+    async def test_messages_during_model_call_are_cached_without_followup_when_disabled(self):
+        self.plugin.config["enable_extra_decision"] = False
         entered, release = asyncio.Event(), asyncio.Event()
 
         async def analyze(*args):

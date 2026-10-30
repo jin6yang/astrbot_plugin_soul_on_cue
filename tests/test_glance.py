@@ -20,8 +20,13 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         )
         self.chat_id = _event().unified_msg_origin
         self.chat = self.plugin._chat(self.chat_id)
+        self.now = 900.0
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("checked topic")))
+        self.plugin.glance_last_check[self.chat_id] = self.chat.incoming_seq
+        self.now = 950.0
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("unread topic")))
         self.chat.last_activity_ts = 950.0
-        self.plugin.glance_last_check[self.chat_id] = 900.0
+        self.now = 1000.0
         self.plugin._build_prompt = AsyncMock(return_value="prompt")
         self.plugin._llm_decision = AsyncMock(return_value='{"should_reply": false}')
         _native_pipeline(self.plugin)
@@ -31,11 +36,11 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin._glance_due(self.chat_id)
         self.plugin._build_prompt.assert_not_awaited()
         self.plugin._llm_decision.assert_not_awaited()
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 900.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 1)
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.plugin._llm_decision.assert_awaited_once()
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
 
     async def test_cooldown_skip_preserves_unchecked_activity(self):
         self.chat.cooldown_until = 1100.0
@@ -56,10 +61,10 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         await self.assert_skipped_activity_is_checked_next_time()
 
     async def test_no_new_activity_does_not_advance_progress_or_call_model(self):
-        self.chat.last_activity_ts = 900.0
+        self.plugin.glance_last_check[self.chat_id] = self.chat.incoming_seq
         for _ in range(2):
             await self.plugin._glance_due(self.chat_id)
-            self.assertEqual(self.plugin.glance_last_check[self.chat_id], 900.0)
+            self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
             self.now = self.plugin.glance_next_due[self.chat_id]
         self.plugin._llm_decision.assert_not_awaited()
 
@@ -70,16 +75,16 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
 
         self.plugin._llm_decision.side_effect = decide
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.plugin._llm_decision.assert_awaited_once()
         await self.plugin.on_message(_event("new topic"))
-        activity_ts = self.chat.last_activity_ts
+        activity_seq = self.chat.incoming_seq
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.assertEqual(self.plugin._llm_decision.await_count, 2)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], activity_ts)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], activity_seq)
         self.plugin.context.send_message.assert_not_awaited()
 
     async def test_invalid_decisions_preserve_activity_until_a_valid_decision(self):
@@ -91,11 +96,11 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(raw=raw):
                 self.plugin._llm_decision.return_value = raw
                 await self.plugin._glance_due(self.chat_id)
-                self.assertEqual(self.plugin.glance_last_check[self.chat_id], 900.0)
+                self.assertEqual(self.plugin.glance_last_check[self.chat_id], 1)
                 self.now = self.plugin.glance_next_due[self.chat_id]
         self.plugin._llm_decision.return_value = '```json\n{"should_reply": "false"}\n```'
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
         self.assertEqual(self.plugin._llm_decision.await_count, len(invalid_results) + 1)
         self.plugin.context.send_message.assert_not_awaited()
 
@@ -108,30 +113,30 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         del self.plugin._llm_decision
         with self.assertLogs(plugin_module.logger, level="ERROR"):
             await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 900.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 1)
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.assertEqual(self.plugin.context.llm_generate.await_count, 2)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
 
     async def test_prompt_failure_does_not_mark_activity_checked(self):
         self.plugin._build_prompt.side_effect = RuntimeError("prompt failed")
         with self.assertRaisesRegex(RuntimeError, "prompt failed"):
             await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 900.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 1)
         self.plugin._llm_decision.assert_not_awaited()
 
     async def test_cancelled_decision_does_not_mark_activity_checked(self):
         self.plugin._llm_decision.side_effect = asyncio.CancelledError()
         with self.assertRaises(asyncio.CancelledError):
             await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 900.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 1)
         self.assertFalse(self.chat.lock.locked())
 
     async def test_successful_reply_does_not_make_old_activity_new_again(self):
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.plugin._llm_decision.assert_awaited_once()
@@ -141,7 +146,7 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
         self.plugin.context.send_message.return_value = False
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 950.0)
+        self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
         self.now = self.plugin.glance_next_due[self.chat_id]
         await self.plugin._glance_due(self.chat_id)
         self.plugin._llm_decision.assert_awaited_once()

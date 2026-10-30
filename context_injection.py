@@ -1,9 +1,16 @@
 """准备本次请求的群聊背景，仅按明确身份排除已提供的消息。"""
 
-from .message_context import ContextSnapshot
+from .message_context import ContextRow, ContextSnapshot
 
 
-def request_background(snapshot: ContextSnapshot, event, req) -> str:
+def request_background(
+    snapshot: ContextSnapshot, event, req, *,
+    target: ContextRow | None = None, include_history: bool = True,
+) -> str:
+    if not include_history:
+        if target is None:
+            return ""
+        snapshot = ContextSnapshot((target,), snapshot.progress)
     bodies = {}
     if (req.prompt and req.prompt.strip()) or getattr(req, "image_urls", None) or getattr(req, "audio_urls", None):
         current_id = event.get_extra("oncue_record_id")
@@ -34,7 +41,16 @@ def request_background(snapshot: ContextSnapshot, event, req) -> str:
                 if message_id and message_id != "unknown":
                     excluded_messages.add((message["role"], message_id))
 
+    # 钩子之后原生历史仍可能被压缩或淘汰，显式目标必须随本次输入保留。
+    # 当前消息仍由 bodies 指向原生当前输入，不重复正文。
+    if target is not None:
+        excluded_messages.discard((target.role, target.message_id))
     context = snapshot.render(body_overrides=bodies, exclude_messages=excluded_messages)
+    if target is not None:
+        context += (
+            f"\n[本次回应目标]\n{target.header}\n"
+            "请围绕这条消息自然回应；它可能早于当前原生输入，其他消息用于理解后续语境。\n[/本次回应目标]"
+        )
     if not context:
         return ""
     return (

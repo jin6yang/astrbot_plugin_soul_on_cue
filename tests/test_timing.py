@@ -290,6 +290,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
             self.now += 20.0
             return True
 
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("group activity")))
         self.chat.last_activity_ts = 950.0
         self.plugin._llm_decision.side_effect = decide
         self.plugin.native_generate.side_effect = generate
@@ -306,6 +307,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
             self.now = 1030.0
             return '{"should_reply": false}'
 
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("group activity")))
         self.chat.last_activity_ts = 950.0
         self.plugin._llm_decision.side_effect = decide
         await self.plugin._glance_due(self.chat_id)
@@ -319,6 +321,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
             self.now = 1050.0
             return ""
 
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("group activity")))
         self.chat.last_activity_ts = 950.0
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
         self.plugin.native_generate.side_effect = generate
@@ -329,6 +332,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.context.send_message.assert_not_awaited()
 
     async def test_glance_checks_cooldown_after_waiting_for_chat_lock(self):
+        self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("group activity")))
         self.chat.last_activity_ts = 950.0
         self.chat.cooldown_until = 1010.0
         async with self.chat.lock:
