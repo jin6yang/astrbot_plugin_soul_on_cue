@@ -1,5 +1,7 @@
 """准备本次请求的群聊背景，仅按明确身份排除已提供的消息。"""
 
+from dataclasses import dataclass
+
 from .message_context import ContextRow, ContextSnapshot
 
 
@@ -61,22 +63,61 @@ def request_background(
     )
 
 
+@dataclass(frozen=True)
+class _OwnedPart:
+    part: object
+    kind: type
+    image_url: object
+    content: dict
+
+    @classmethod
+    def capture(cls, part):
+        return cls(part, type(part), getattr(part, "image_url", None), part.model_dump_for_context())
+
+    def unchanged(self, parts) -> bool:
+        if not any(part is self.part for part in parts):
+            return False
+        if type(self.part) is not self.kind or getattr(self.part, "image_url", None) is not self.image_url:
+            return False
+        try:
+            return self.part.model_dump_for_context() == self.content
+        except Exception:
+            # 其它插件已接手甚至改换结构时，不再处理这个对象。
+            return False
+
+
 def set_temporary_background(req, text: str, text_part_type, *, images=(), image_part_type=None) -> None:
-    """只替换本插件在同一请求中拥有的内容块，不动其他插件的内容。"""
-    owned = getattr(req, "_oncue_context_part", None)
-    owned_images = getattr(req, "_oncue_image_parts", ())
-    parts = [
-        part for part in (getattr(req, "extra_user_content_parts", None) or [])
-        if part is not owned and not any(part is own for own in owned_images)
-    ]
-    new_part = text_part_type(text=text).mark_as_temp() if text else None
+    """只替换仍未被改写的自有块；被其它插件接手后不再注入该类内容。"""
+    original = getattr(req, "extra_user_content_parts", None) or []
+    owned = getattr(req, "_oncue_context_owner", None)
+    owned_images = getattr(req, "_oncue_image_owners", ())
+    text_released = getattr(req, "_oncue_context_released", False)
+    images_released = getattr(req, "_oncue_images_released", False)
+    replace_text = owned is not None and owned.unchanged(original)
+    if owned is not None and not replace_text:
+        text_released = True
+    replace_images = [entry for entry in owned_images if entry.unchanged(original)]
+    if len(replace_images) != len(owned_images):
+        images_released = True
+    # 不按 URL、正文标签或拷贝的识别字段认领对象，也不原地修改外部列表。
+    parts = [part for part in original if not (
+        (replace_text and part is owned.part)
+        or any(part is entry.part for entry in replace_images)
+    )]
+    new_part = text_part_type(text=text).mark_as_temp() if text and not text_released else None
     if new_part is not None:
         parts.append(new_part)
-    new_images = [image_part_type(image_url={"url": url}).mark_as_temp() for url in images] if image_part_type else []
+    new_images = [
+        image_part_type(image_url={"url": url}).mark_as_temp() for url in images
+    ] if image_part_type and not images_released else []
     parts.extend(new_images)
     req.extra_user_content_parts = parts
     req._oncue_context_part = new_part
     req._oncue_image_parts = new_images
+    req._oncue_context_owner = _OwnedPart.capture(new_part) if new_part is not None else None
+    req._oncue_image_owners = tuple(_OwnedPart.capture(part) for part in new_images)
+    req._oncue_context_released = text_released
+    req._oncue_images_released = images_released
 
 
 def add_stage_direction(req, line: str) -> None:

@@ -28,6 +28,16 @@ class TextPart:
         self._no_save = True
         return self
 
+    def model_dump_for_context(self):
+        data = {"type": self.type}
+        if self.type == "image_url":
+            data["image_url"] = vars(self.image_url).copy()
+        else:
+            data["text"] = self.text
+        if self._no_save:
+            data["_no_save"] = True
+        return data
+
 
 class ImageURLPart(TextPart):
     type = "image_url"

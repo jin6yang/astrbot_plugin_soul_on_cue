@@ -1326,12 +1326,6 @@ class OnCuePlugin(Star):
         elif trigger:
             await self._decide(event, chat, *trigger, summoned_version=summoned_version)
 
-    @filter.on_waiting_llm_request()
-    async def note_native_image_request(self, event: AstrMessageEvent):
-        decision = event.get_extra("oncue_decision")
-        if isinstance(decision, dict) and decision.get("should_reply"):
-            event.set_extra("oncue_native_image_request", event.get_extra("provider_request") is None)
-
     @filter.on_agent_done()
     async def close_image_requests(self, event: AstrMessageEvent, run_context, response):
         self._close_image_round(event)
@@ -1383,10 +1377,6 @@ class OnCuePlugin(Star):
         if isinstance(snapshot, ContextSnapshot):
             target = decision.get("_target")
             include_history = self._cfg_bool("enable_context_injection", True)
-            mode = self._image_mode()
-            native_owned = event.get_extra("oncue_native_image_request", False)
-            if native_owned and mode in {"placeholder", "describe"}:
-                req.image_urls = []
             budget = event.get_extra("oncue_image_round")
             if not isinstance(budget, CaptionRound) or budget.closed:
                 budget = self._new_image_round(self._chat(event.unified_msg_origin))
@@ -1407,8 +1397,6 @@ class OnCuePlugin(Star):
                     max_size=self.image_models.image_max_size(event.unified_msg_origin),
                 )
                 working, direct_images = prepared.snapshot, prepared.image_urls
-                if native_owned and self._image_mode() in {"placeholder", "describe"}:
-                    req.image_urls = []
                 target = working.target(target.message_id or target.record_id) if target else None
                 chat = self._chat(event.unified_msg_origin)
                 async with chat.lock:

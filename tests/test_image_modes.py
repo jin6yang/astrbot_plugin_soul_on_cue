@@ -1,6 +1,7 @@
 """图片模式通过现有原生钩子接入，不改原生配置或其它插件内容。"""
 
 import asyncio
+import copy
 import tempfile
 import unittest
 from pathlib import Path
@@ -82,19 +83,20 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
     async def approve(self, event=None):
         event = event or self.event()
         await self.plugin.on_message(event)
-        await self.plugin.note_native_image_request(event)
         return event
 
-    async def test_placeholder_removes_current_native_images_but_preserves_foreign_content(self):
+    async def test_placeholder_preserves_native_images_and_foreign_content(self):
         self.plugin.config["image_mode"] = "不转述（仅占位）"
         event = await self.approve()
         ref = self.chat.messages[-1]["parts"][1].image
         ref.description = "OLD_DESCRIPTION_MUST_BE_HIDDEN"
         foreign = ImageURLPart(image_url={"url": "foreign-image"})
         req = self.request(extras=[foreign])
+        native_images = req.image_urls
         contexts = list(req.contexts)
         await self.plugin.inject_stage_direction(event, req)
-        self.assertEqual(req.image_urls, [])
+        self.assertIs(req.image_urls, native_images)
+        self.assertEqual(req.image_urls, ["native-image"])
         self.assertEqual(req.audio_urls, ["native-audio"])
         self.assertEqual(req.contexts, contexts)
         self.assertIs(req.extra_user_content_parts[0], foreign)
@@ -108,8 +110,10 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config["image_mode"] = "仅转述"
         event = await self.approve()
         req = self.request()
+        native_images = req.image_urls
         await self.plugin.inject_stage_direction(event, req)
-        self.assertEqual(req.image_urls, [])
+        self.assertIs(req.image_urls, native_images)
+        self.assertEqual(req.image_urls, ["native-image"])
         self.assertIn("可见的一只猫", _request_text(req))
         self.assertEqual(_request_text(req).count("native original text"), 1)
         self.assertTrue(all(part._no_save for part in req.extra_user_content_parts))
@@ -129,6 +133,109 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.inject_stage_direction(event, req)
         self.assertEqual(req.image_urls, ["native-image"])
 
+    async def test_both_text_modes_preserve_external_images_and_image_history(self):
+        for index, mode in enumerate(("不转述（仅占位）", "仅转述")):
+            with self.subTest(mode=mode):
+                self.plugin.config["image_mode"] = mode
+                event = await self.approve(self.event(f"isolated-{index}"))
+                # A stale flag cannot establish ownership of the later request.
+                event.set_extra("oncue_native_image_request", True)
+                shared_url = f"https://platform.invalid/isolated-{index}/0.png"
+                native_images = [shared_url, "other-plugin-image", shared_url]
+                foreign = ImageURLPart(image_url={"url": shared_url, "detail": "low"})
+                foreign_dict = {"type": "image_url", "image_url": {"url": "emoji-image", "detail": "high"}, "source": "emoji-plugin"}
+                extras = [foreign, foreign_dict]
+                req = self.request(images=native_images, extras=extras)
+                history = [
+                    {"role": "user", "content": [{"type": "image_url", "image_url": {"url": shared_url}}]},
+                    {"role": "tool", "content": [{"type": "image_url", "image_url": {"url": "tool-image"}}]},
+                ]
+                req.contexts = history
+                original_history = copy.deepcopy(history)
+                original_dict = copy.deepcopy(foreign_dict)
+                for _ in range(2):
+                    await self.plugin.inject_stage_direction(event, req)
+                self.assertIs(req.image_urls, native_images)
+                self.assertEqual(native_images, [shared_url, "other-plugin-image", shared_url])
+                self.assertIs(req.contexts, history)
+                self.assertEqual(history, original_history)
+                self.assertIs(req.extra_user_content_parts[0], foreign)
+                self.assertIs(req.extra_user_content_parts[1], foreign_dict)
+                self.assertEqual(foreign.image_url.url, shared_url)
+                self.assertEqual(foreign.image_url.detail, "low")
+                self.assertEqual(foreign_dict, original_dict)
+                self.assertEqual(extras, [foreign, foreign_dict])
+
+    async def test_request_set_after_the_waiting_notification_keeps_all_attachments(self):
+        for index, mode in enumerate(("不转述（仅占位）", "仅转述")):
+            with self.subTest(mode=mode):
+                self.plugin.config["image_mode"] = mode
+                event = await self.approve(self.event(f"late-request-{index}"))
+                event.set_extra("oncue_native_image_request", True)
+                images = ["custom-request-image", "custom-request-image"]
+                foreign = ImageURLPart(image_url={"url": "custom-extra-image"})
+                req = self.request(images=images, extras=[foreign])
+                event.set_extra("provider_request", req)
+                await self.plugin.inject_stage_direction(event, req)
+                self.assertIs(event.get_extra("provider_request"), req)
+                self.assertIs(req.image_urls, images)
+                self.assertEqual(images, ["custom-request-image", "custom-request-image"])
+                self.assertIs(req.extra_user_content_parts[0], foreign)
+
+    async def test_external_images_added_or_replaced_during_caption_wait_survive(self):
+        self.plugin.config["image_mode"] = "仅转述"
+        event = await self.approve()
+        entered, release = asyncio.Event(), asyncio.Event()
+
+        async def generate(**kwargs):
+            entered.set()
+            await release.wait()
+            return SimpleNamespace(completion_text="插件图片描述")
+
+        self.context.llm_generate.side_effect = generate
+        original_list = ["original-native-image"]
+        req = self.request(images=original_list)
+        task = asyncio.create_task(self.plugin.inject_stage_direction(event, req))
+        self.tasks.append(task)
+        try:
+            await asyncio.wait_for(entered.wait(), 1)
+            replacement_images = ["emoji-plugin-replacement"]
+            req.image_urls = replacement_images
+            foreign = ImageURLPart(image_url={"url": "late-extra-image"})
+            foreign_dict = {"type": "image_url", "image_url": {"url": "late-dict-image"}}
+            req.extra_user_content_parts.extend([foreign, foreign_dict])
+            release.set()
+            await asyncio.wait_for(task, 1)
+            self.assertIs(req.image_urls, replacement_images)
+            self.assertEqual(replacement_images, ["emoji-plugin-replacement"])
+            self.assertEqual(original_list, ["original-native-image"])
+            self.assertIs(req.extra_user_content_parts[0], foreign)
+            self.assertIs(req.extra_user_content_parts[1], foreign_dict)
+            self.assertEqual(foreign_dict["image_url"]["url"], "late-dict-image")
+            self.assertIn("插件图片描述", _request_text(req))
+        finally:
+            release.set()
+
+    async def test_emoji_replacement_in_outgoing_result_is_not_modified(self):
+        for index, mode in enumerate(("不转述（仅占位）", "仅转述")):
+            with self.subTest(mode=mode):
+                self.plugin.config["image_mode"] = mode
+                event = await self.approve(self.event(f"outgoing-{index}"))
+                image = plugin_module.Image()
+                image.url = "https://emoji.invalid/replaced-emotion.png"
+                body = Plain("表情插件替换后的回复")
+                chain = [body, image]
+                event.set_result(event.chain_result(chain))
+                event._has_send_oper = True
+                result = event.get_result()
+                await self.plugin.mark_reply_sent(event)
+                self.assertIs(event.get_result(), result)
+                self.assertIs(result.chain, chain)
+                self.assertIs(chain[0], body)
+                self.assertIs(chain[1], image)
+                self.assertEqual(image.url, "https://emoji.invalid/replaced-emotion.png")
+                self.assertEqual(body.text, "表情插件替换后的回复")
+
     async def test_unknown_reply_replaces_owned_visuals_but_preserves_foreign_parts(self):
         self.plugin.config.update(image_request_count=3, image_caption_budget=0)
         older = self.event("older", summoned=False)
@@ -139,9 +246,11 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         self.chat.messages[0]["parts"][1].image.description = "历史图片的已有描述"
         event.set_extra("selected_provider", "vision")
         foreign = ImageURLPart(image_url={"url": "foreign-image"})
-        owned = ImageURLPart(image_url={"url": "previous-oncue-image"}).mark_as_temp()
-        req = self.request(extras=[foreign, owned])
-        req._oncue_image_parts = [owned]
+        req = self.request(extras=[foreign])
+        plugin_module.set_temporary_background(
+            req, "old oncue context", plugin_module.TextPart,
+            images=["previous-oncue-image"], image_part_type=ImageURLPart,
+        )
         for _ in range(2):
             await self.plugin.inject_stage_direction(event, req)
         self.assertEqual(req.image_urls, ["native-image"])
@@ -192,7 +301,6 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         await self.plugin.on_message(self.event("later", summoned=False))
         release.set()
         await asyncio.wait_for(task, 1)
-        await self.plugin.note_native_image_request(event)
         req = self.request()
         await self.plugin.inject_stage_direction(event, req)
         self.assertIs(event.get_extra("oncue_image_round"), budget)
@@ -243,7 +351,9 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.config["image_mode"] = "仅转述"
         self.context.llm_generate.side_effect = APIError("server busy")
         event = await self.approve()
-        req = self.request()
+        images = ["foreign-image-on-error"]
+        foreign = ImageURLPart(image_url={"url": "foreign-extra-on-error"})
+        req = self.request(images=images, extras=[foreign])
         with self.assertLogs(plugin_module.logger, level="WARNING") as logs:
             await self.plugin.inject_stage_direction(event, req)
         self.assertIn("模型=caption", "\n".join(logs.output))
@@ -253,6 +363,9 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ref.description, "")
         self.assertIn("内容未读取", _request_text(req))
         self.assertFalse(req._oncue_image_parts)
+        self.assertIs(req.image_urls, images)
+        self.assertEqual(images, ["foreign-image-on-error"])
+        self.assertIs(req.extra_user_content_parts[0], foreign)
 
     async def test_overlong_caption_preserves_ends_and_marks_truncation(self):
         self.plugin.config.update(image_mode="仅转述", message_char_limit=100)
@@ -346,7 +459,10 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(completion_text="caption")
 
         self.context.llm_generate.side_effect = generate
-        task = asyncio.create_task(self.plugin.inject_stage_direction(event, self.request()))
+        images = ["foreign-image-on-cancel"]
+        foreign = ImageURLPart(image_url={"url": "foreign-extra-on-cancel"})
+        req = self.request(images=images, extras=[foreign])
+        task = asyncio.create_task(self.plugin.inject_stage_direction(event, req))
         self.tasks.append(task)
         try:
             await asyncio.wait_for(entered.wait(), 1)
@@ -357,6 +473,9 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
             self.assertIsNone(event.get_extra("oncue_decision"))
             self.assertIsNone(event.get_extra("oncue_image_round"))
             self.assertTrue(event.stopped)
+            self.assertIs(req.image_urls, images)
+            self.assertEqual(images, ["foreign-image-on-cancel"])
+            self.assertIs(req.extra_user_content_parts[0], foreign)
         finally:
             release.set()
 
@@ -371,7 +490,9 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
             return SimpleNamespace(completion_text="CAPTION_SHOULD_BE_HIDDEN")
 
         self.context.llm_generate.side_effect = generate
-        req = self.request()
+        images = ["foreign-image-during-mode-switch"]
+        foreign = ImageURLPart(image_url={"url": "foreign-extra-during-mode-switch"})
+        req = self.request(images=images, extras=[foreign])
         task = asyncio.create_task(self.plugin.inject_stage_direction(event, req))
         self.tasks.append(task)
         await asyncio.wait_for(entered.wait(), 1)
@@ -379,7 +500,9 @@ class ImageModeTests(unittest.IsolatedAsyncioTestCase):
         release.set()
         await asyncio.wait_for(task, 1)
         self.assertNotIn("CAPTION_SHOULD_BE_HIDDEN", _request_text(req))
-        self.assertEqual(req.image_urls, [])
+        self.assertIs(req.image_urls, images)
+        self.assertEqual(images, ["foreign-image-during-mode-switch"])
+        self.assertIs(req.extra_user_content_parts[0], foreign)
         self.assertFalse(req._oncue_image_parts)
 
 
