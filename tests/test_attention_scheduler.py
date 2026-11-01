@@ -188,17 +188,18 @@ class AttentionSchedulerTests(unittest.IsolatedAsyncioTestCase):
         chat.incoming_seq = 10
         self.plugin.glance_last_check[chat_id] = 10
         chat.attention.apply("start", "等待进展", "source", 1200.0, 10, expected_revision=0)
-        self.plugin._create_glance_event = lambda chat: _event("[主动发言机会]")
+        self.plugin._create_glance_trigger = lambda chat: _event("[主动发言机会]")
+        self.plugin._glance_available = AsyncMock(return_value=True)
         self.plugin._build_prompt = AsyncMock(return_value="prompt")
         self.plugin._llm_decision = AsyncMock()
-        self.plugin._run_native_reply = AsyncMock()
+        self.plugin._run_glance_task = AsyncMock()
         await self.plugin._glance_due(chat_id)
         self.assertFalse(chat.attention.active)
         self.assertIn("3 小时", chat.attention.notice.reason)
         self.assertEqual(chat.incoming_seq, 10)
         self.assertEqual(self.plugin.glance_last_check[chat_id], 10)
         self.plugin._llm_decision.assert_not_awaited()
-        self.plugin._run_native_reply.assert_not_awaited()
+        self.plugin._run_glance_task.assert_not_awaited()
         self.assertFalse(chat.glance_inflight)
 
     async def test_terminate_waits_for_jobs_before_closing_caption_service_and_cache(self):

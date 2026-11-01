@@ -154,15 +154,14 @@ class ReplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.chat.reply_ts), [])
         self.assertEqual(list(self.chat.messages), [])
 
-    async def test_glance_success_updates_both_histories_without_new_user_activity(self):
+    async def test_native_task_summary_stays_out_of_plugin_history_and_reply_count(self):
         self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("group activity")))
         self.chat.last_activity_ts = 950.0
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.chat.messages[-1]["text"], "glance reply")
-        self.assertEqual(self.chat.messages[-1]["role"], "assistant")
+        self.assertEqual([item["text"] for item in self.chat.messages], ["group activity"])
         self.assertEqual(self.chat.last_activity_ts, 950.0)
-        self.assertEqual(list(self.chat.reply_ts), [1000.0])
-        self.plugin.native_history.assert_awaited_once_with(self.chat_id, "glance reply")
+        self.assertEqual(list(self.chat.reply_ts), [])
+        self.plugin.native_history.assert_awaited_once_with(self.chat_id, "task summary")
 
     async def test_glance_failed_send_does_not_update_either_history(self):
         self.plugin._append_message(self.chat, self.plugin._event_to_item(_event("group activity")))

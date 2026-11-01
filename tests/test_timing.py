@@ -47,6 +47,12 @@ class ImageURLPart(TextPart):
         self._no_save = False
 
 
+class Message:
+    def __init__(self, *, role, content):
+        self.role = role
+        self.content = content
+
+
 def _request_text(req):
     parts = [req.prompt] if req.prompt else []
     for part in getattr(req, "extra_user_content_parts", []):
@@ -110,15 +116,17 @@ def _load_plugin():
                 on_llm_request=decorator,
                 on_waiting_llm_request=decorator,
                 on_agent_done=decorator,
+                on_agent_begin=decorator,
+                on_llm_tool_respond=decorator,
                 on_decorating_result=decorator,
                 after_message_sent=decorator,
             ),
         },
-        "astrbot.api.provider": {"ProviderRequest": object},
+        "astrbot.api.provider": {"ProviderRequest": SimpleNamespace},
         "astrbot.api.star": {"Context": object, "Star": Star, "StarTools": object},
         "astrbot.core": {},
         "astrbot.core.agent": {},
-        "astrbot.core.agent.message": {"TextPart": TextPart, "ImageURLPart": ImageURLPart},
+        "astrbot.core.agent.message": {"TextPart": TextPart, "ImageURLPart": ImageURLPart, "Message": Message},
         "astrbot.core.message": {},
         "astrbot.core.message.components": {
             "Plain": Plain,
@@ -145,35 +153,39 @@ plugin_module = _load_plugin()
 
 
 def _native_pipeline(plugin, reply="reply"):
-    """在插件状态测试中替代原生管道；原生适配另有契约测试。"""
+    """Stub native task transport for state tests; lifecycle has separate tests."""
     plugin.config["enable_glance"] = True
     plugin.native_generate = AsyncMock(return_value=reply)
     plugin.native_history = AsyncMock()
+    plugin._glance_available = AsyncMock(return_value=True)
+    owned = {}
 
     def create(chat):
-        event = _event("[主动发言机会]")
-        event.delivered = []
-        return event
+        return plugin_module.GlanceTrigger(chat.glance_target or {
+            "umo": _event().unified_msg_origin, "self_id": "bot", "group_id": "1",
+        })
 
-    async def run(event):
-        req = SimpleNamespace(prompt="[主动发言机会]", system_prompt="原生人格")
-        await plugin.inject_stage_direction(event, req)
-        if event.stopped:
+    async def run(trigger, *, is_current):
+        if not await is_current():
             return
-        text = await plugin.native_generate(prompt=_request_text(req))
-        if not text or not await plugin._glance_can_send(plugin._chat(event.unified_msg_origin), event):
+        event = _event("native task context")
+        state = SimpleNamespace(trigger=trigger, job_id="test-task", injected_contexts=[])
+        owned[id(event)] = state
+        context = SimpleNamespace(messages=[])
+        await plugin.prepare_glance_task(event, context)
+        prompt = "\n".join(part.text for message in context.messages for part in message.content)
+        text = await plugin.native_generate(prompt=prompt)
+        if not text or not await is_current():
             return
         ok = await plugin.context.send_message(event.unified_msg_origin, [Plain(text)])
         if not ok:
             return
-        event._has_send_oper = True
-        event.delivered = [Plain(text)]
-        event.result.chain = event.delivered
-        await plugin.mark_reply_sent(event)
-        await plugin.native_history(event.unified_msg_origin, text)
+        await plugin.close_image_requests(event, context, SimpleNamespace(completion_text="task summary"))
+        await plugin.native_history(event.unified_msg_origin, "task summary")
 
-    plugin._create_glance_event = create
-    plugin._run_native_reply = AsyncMock(side_effect=run)
+    plugin._create_glance_trigger = create
+    plugin.native_tasks.owned_run = lambda event: owned.get(id(event))
+    plugin.native_tasks.run = AsyncMock(side_effect=run)
 
 
 class TimingTests(unittest.IsolatedAsyncioTestCase):
@@ -297,7 +309,7 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.plugin._trigger_ready(self.chat, "dense", 1069.0))
         self.assertTrue(self.plugin._trigger_ready(self.chat, "dense", 1070.0))
 
-    async def test_glance_slow_send_uses_completion_time(self):
+    async def test_glance_slow_task_schedules_from_completion_without_confirming_delivery(self):
         async def decide(*args):
             self.now += 15.0
             return '{"should_reply": true, "reason": "topic"}'
@@ -316,11 +328,11 @@ class TimingTests(unittest.IsolatedAsyncioTestCase):
         self.plugin.native_generate.side_effect = generate
         self.plugin.context.send_message.side_effect = send
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(self.chat.last_reply_ts, 1060.0)
-        self.assertEqual(list(self.chat.reply_ts), [1060.0])
-        self.assertEqual(self.chat.cooldown_until, 1070.0)
+        self.assertEqual(self.chat.last_reply_ts, 0.0)
+        self.assertEqual(list(self.chat.reply_ts), [])
+        self.assertEqual(self.chat.cooldown_until, 1025.0)
         self.assertEqual(self.plugin.glance_next_due[self.chat_id], 1960.0)
-        self.plugin.native_history.assert_awaited_once_with(self.chat_id, "reply")
+        self.plugin.native_history.assert_awaited_once_with(self.chat_id, "task summary")
 
     async def test_glance_negative_decision_uses_completion_time(self):
         async def decide(*args):

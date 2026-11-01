@@ -330,7 +330,7 @@ class ExtraDecisionTests(unittest.IsolatedAsyncioTestCase):
         await task
         self.plugin.native_generate.assert_awaited_once()
         self.plugin.context.send_message.assert_awaited_once()
-        self.assertEqual(len(self.chat.reply_ts), 1)
+        self.assertEqual(len(self.chat.reply_ts), 0)
         self.assertEqual(self.chat.pending_replies, {})
 
     async def test_glance_leaves_messages_during_extra_request_for_next_check(self):

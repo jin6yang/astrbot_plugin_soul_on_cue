@@ -174,7 +174,7 @@ class DecisionCardTests(unittest.IsolatedAsyncioTestCase):
         with self.assertLogs(plugin_module.logger, level="ERROR"):
             await self.plugin._glance_due(self.event.unified_msg_origin)
         self.assertEqual(self.plugin.glance_last_check[self.event.unified_msg_origin], 0)
-        self.plugin._run_native_reply.assert_not_awaited()
+        self.plugin.native_tasks.run.assert_not_awaited()
         self.assertFalse(self.chat.glance_inflight)
         self.assert_no_decision_effects()
 

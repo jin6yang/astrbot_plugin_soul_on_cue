@@ -13,7 +13,7 @@ from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
 from astrbot.api.provider import ProviderRequest
 from astrbot.api.star import Context, Star, StarTools
-from astrbot.core.agent.message import ImageURLPart, TextPart
+from astrbot.core.agent.message import ImageURLPart, Message, TextPart
 from astrbot.core.message.components import At, Image, Plain, Reply
 from astrbot.core.message.message_event_result import ResultContentType
 
@@ -24,6 +24,7 @@ from .image_caption import CaptionRound, ImageCaptionService
 from .image_input import ImageInputPreparer
 from .image_models import ImageModels
 from .message_context import ContextRow, ContextSnapshot, ImageReference, MessagePart, iter_image_parts, iter_images, render_message, snapshot_parts
+from .native_tasks import GlanceTrigger, NativeGlanceTasks
 
 
 MESSAGE_CACHE_LIMIT = 300
@@ -107,6 +108,8 @@ class OnCuePlugin(Star):
         self.glance_last_check: dict[str, int] = {}  # 最近有效一瞥决策所见的消息序号
         self.glance_task: asyncio.Task | None = None
         self._glance_jobs: dict[str, asyncio.Task] = {}
+        self.native_tasks = NativeGlanceTasks(context, logger=logger)
+        self._glance_issue: str | None = None
         self._decision_card_issue: str | None = None
         self.kb_missing_warned = False
         self.kb_not_taken_warned = False
@@ -163,6 +166,7 @@ class OnCuePlugin(Star):
         if glance_jobs:
             await asyncio.gather(*glance_jobs, return_exceptions=True)
         self._glance_jobs.clear()
+        await self.native_tasks.close()
         if self.image_cache:
             if self.image_captions:
                 await self.image_captions.close()
@@ -436,6 +440,8 @@ class OnCuePlugin(Star):
         for chat_id, chat in list(self.chats.items()):
             async with chat.lock:
                 self._refresh_attention(chat_id, chat, now)
+            if not self._cfg_bool("enable", True) or not self._cfg_bool("enable_glance", False):
+                await self.native_tasks.cancel_chat(chat_id)
         if self._terminating or not self._cfg_bool("enable", True) or not self._cfg_bool("enable_glance", False):
             return
         # 至多两个会话同时运行，按已排定的时间先后领取空位；不在轮询中等待模型。
@@ -464,18 +470,12 @@ class OnCuePlugin(Star):
             logger.error(f"[OnCue] GLANCE 执行失败 {chat_id}: {exc}")
             self._schedule_glance(chat_id, time.time())
 
-    def _create_glance_event(self, chat: ChatFacts):
+    def _create_glance_trigger(self, chat: ChatFacts):
         if chat.glance_target is None:
             return None
-        from .native_reply import GlanceEvent
+        return GlanceTrigger(chat.glance_target)
 
-        async def can_send():
-            return await self._glance_can_send(chat, event)
-
-        event = GlanceEvent(self.context, chat.glance_target, can_send)
-        return event
-
-    async def _glance_can_send(self, chat: ChatFacts, event: AstrMessageEvent) -> bool:
+    async def _glance_is_current(self, chat: ChatFacts, event) -> bool:
         async with chat.lock:
             decision = event.get_extra("oncue_decision")
             return bool(
@@ -484,10 +484,67 @@ class OnCuePlugin(Star):
                 and decision.get("_reply_version") == chat.reply_version
             )
 
-    async def _run_native_reply(self, event: AstrMessageEvent) -> None:
-        from .native_reply import run_native_reply
+    async def _glance_available(self, chat_id: str) -> bool:
+        manager = getattr(self.context, "cron_manager", None)
+        issue = None
+        if manager is None or not all(callable(getattr(manager, name, None)) for name in (
+            "add_active_job", "run_job_now", "delete_job",
+        )):
+            issue = "AstrBot 原生未来任务接口不可用，跳过一瞥"
+        else:
+            config = self.context.get_config(umo=chat_id)
+            runner = config.get("agent_runner", {})
+            if isinstance(runner, dict) and runner.get("runner_type", "local") != "local":
+                issue = "一瞥目前需要 AstrBot 内置 Agent，跳过第三方 Agent 会话"
+            elif not config.get("provider_settings", {}).get("enable", True):
+                return False
+            enabled = config.get("plugin_set", ["*"])
+            if enabled != ["*"] and "astrbot_plugin_soul_on_cue" not in enabled:
+                return False
+        if issue:
+            if issue != self._glance_issue:
+                logger.error(f"[OnCue][GLANCE] {issue}")
+                self._glance_issue = issue
+            return False
+        from astrbot.core.star.session_llm_manager import SessionServiceManager
+        from astrbot.core.star.session_plugin_manager import SessionPluginManager
 
-        await run_native_reply(self.context, event)
+        if not await SessionServiceManager.is_session_enabled(chat_id):
+            return False
+        if not await SessionPluginManager.is_plugin_enabled_for_session(
+            chat_id, "astrbot_plugin_soul_on_cue",
+        ) or not await SessionServiceManager.is_llm_enabled_for_session(chat_id):
+            return False
+        self._glance_issue = None
+        return True
+
+    async def _run_glance_task(self, trigger) -> None:
+        chat = self._chat(trigger.unified_msg_origin)
+        if not await self._prepare_glance_input(trigger):
+            return
+
+        async def current():
+            return await self._glance_is_current(chat, trigger) and await self._glance_available(
+                trigger.unified_msg_origin,
+            )
+
+        await self.native_tasks.run(trigger, is_current=current)
+
+    async def _prepare_glance_input(self, trigger) -> bool:
+        decision = trigger.get_extra("oncue_decision")
+        if not isinstance(decision, dict) or not await self._glance_is_current(
+            self._chat(trigger.unified_msg_origin), trigger,
+        ):
+            return False
+        # Prepare before starting the native task: AgentBegin hook failures do
+        # not stop AstrBot's runner, so asynchronous work must finish here.
+        req = ProviderRequest(prompt="", contexts=[], image_urls=[], audio_urls=[])
+        prepared = await self._prepare_reply_context(trigger, decision, req)
+        if prepared is None:
+            return False
+        context, _images = prepared
+        trigger.set_extra("oncue_task_input", (self._reply_direction(decision), context))
+        return True
 
     async def _glance_due(self, chat_id: str) -> None:
         chat = self._chat(chat_id)
@@ -498,32 +555,24 @@ class OnCuePlugin(Star):
             chat.glance_inflight = True
         event = None
         try:
-            event = self._create_glance_event(chat)
+            event = self._create_glance_trigger(chat)
             if event is None:
                 return
+            if not await self._glance_available(chat_id):
+                return
             if await self._decide(event, chat, "你刚忙完自己的事，顺手瞄了一眼群聊。", "glance"):
-                await self._run_native_reply(event)
+                await self._run_glance_task(event)
         finally:
             if event is not None:
                 self._close_image_round(event)
-            try:
-                # 原生工具发送/部分分段发送可能没有最终钩子，只补记有发送凭据的内容。
-                if event is not None and event._has_send_oper and event.get_extra("oncue_decision"):
-                    delivered = list(getattr(event, "delivered", []))
-                    tool_texts = event.get_extra("_send_message_to_user_current_session_plain_texts", [])
-                    if isinstance(tool_texts, list):
-                        delivered.extend(Plain(t) for t in tool_texts if isinstance(t, str) and t.strip())
-                    event.set_result(event.chain_result(delivered or [Plain("[已发送消息]")]))
-                    await self.mark_reply_sent(event)
-            finally:
-                async with chat.lock:
-                    if event is not None:
-                        decision = event.get_extra("oncue_decision")
-                        if isinstance(decision, dict):
-                            chat.pending_replies.pop(decision.get("_reservation"), None)
-                            event.set_extra("oncue_decision", None)
-                    chat.glance_inflight = False
-                    self._schedule_glance(chat_id, time.time(), min_ts=chat.cooldown_until + 1)
+            async with chat.lock:
+                if event is not None:
+                    decision = event.get_extra("oncue_decision")
+                    if isinstance(decision, dict):
+                        chat.pending_replies.pop(decision.get("_reservation"), None)
+                        event.set_extra("oncue_decision", None)
+                chat.glance_inflight = False
+                self._schedule_glance(chat_id, time.time(), min_ts=chat.cooldown_until + 1)
 
     def _kb_plugin(self):
         try:
@@ -1256,6 +1305,8 @@ class OnCuePlugin(Star):
         pending = None
         summoned = False
         summoned_version = None
+        direct_summoned = False
+        interrupt_glance = False
         async with chat.lock:
             now = time.time()
             observing = self._is_observing(chat, now)
@@ -1270,8 +1321,6 @@ class OnCuePlugin(Star):
                     "umo": event.unified_msg_origin,
                     "self_id": event.get_self_id(),
                     "group_id": event.get_group_id(),
-                    "platform_meta": event.platform_meta,
-                    "session_isolated": event.get_extra("_session_isolated", False),
                 }
             if item["active"]:
                 chat.last_activity_ts = now
@@ -1282,6 +1331,7 @@ class OnCuePlugin(Star):
             if self._is_forced(event, item):
                 self._cancel_message_wait(chat)
                 chat.reply_version += 1
+                interrupt_glance = True
                 if self._cfg_bool("force_reply_when_summoned", True):
                     event.set_extra("oncue_decision", {
                         "should_reply": True, "speaker": "", "mood": "", "reason": "被@/点名直接回复",
@@ -1290,18 +1340,21 @@ class OnCuePlugin(Star):
                     })
                     event.is_at_or_wake_command = True
                     logger.info(f"[OnCue] 点名直接回复: {item['sender_name']} | {item['pure_text'][:60]}")
-                    return
-                # 只关闭默认 LLM 放行，保留其它插件处理；决策同意后再唤醒。
-                event.is_at_or_wake_command = False
-                summoned = True
-                summoned_version = chat.reply_version
+                    direct_summoned = True
+                else:
+                    # 只关闭默认 LLM 放行，保留其它插件处理；决策同意后再唤醒。
+                    event.is_at_or_wake_command = False
+                    summoned = True
+                    summoned_version = chat.reply_version
             elif chat.message_wait is not None:
                 if item["active"]:
                     chat.message_wait.latest_item = item
                     chat.message_wait.last_activity_at = time.monotonic()
                     chat.message_wait.changed.set()
                 return
-            if summoned:
+            if direct_summoned:
+                trigger = None
+            elif summoned:
                 trigger = ("有人@、引用、使用唤醒前缀或昵称呼唤你。优先考虑回应，但仍可按角色性格和语境保持沉默。", None)
             elif observing:
                 trigger = ("你刚才已经开口过，现在还在观测窗内；判断这一幕是否值得再接话。", None)
@@ -1321,6 +1374,10 @@ class OnCuePlugin(Star):
                     reply_version=chat.reply_version,
                 )
                 chat.message_wait = pending
+        if interrupt_glance:
+            await self.native_tasks.cancel_chat(event.unified_msg_origin)
+        if direct_summoned:
+            return
         if pending is not None:
             await self._wait_for_messages(event, chat, pending)
         elif trigger:
@@ -1329,6 +1386,58 @@ class OnCuePlugin(Star):
     @filter.on_agent_done()
     async def close_image_requests(self, event: AstrMessageEvent, run_context, response):
         self._close_image_round(event)
+        run = self.native_tasks.owned_run(event)
+        if run is not None:
+            self._close_image_round(run.trigger)
+            usage = getattr(response, "usage", None)
+            tokens = getattr(usage, "total", None)
+            logger.info(
+                f"[OnCue][GLANCE] Agent 已结束: job={run.job_id} | "
+                f"最终响应上报token={tokens}（非全轮合计） | "
+                "输出为原生任务结果，不作为群聊正文或送达回执"
+            )
+
+    @filter.on_agent_begin()
+    async def prepare_glance_task(self, event: AstrMessageEvent, run_context):
+        run = self.native_tasks.owned_run(event)
+        if run is None or any(previous is run_context for previous in run.injected_contexts):
+            return
+        decision = run.trigger.get_extra("oncue_decision")
+        chat = self.chats.get(event.unified_msg_origin)
+        if (
+            not isinstance(decision, dict) or chat is None or self._terminating
+            or not self._cfg_bool("enable", True) or not self._cfg_bool("enable_glance", False)
+            or decision.get("_reply_version") != chat.reply_version
+        ):
+            return
+        prepared = run.trigger.get_extra("oncue_task_input")
+        if not isinstance(prepared, tuple) or len(prepared) != 2:
+            logger.error(f"[OnCue][GLANCE] 缺少本轮临时输入: job={run.job_id}")
+            return
+        direction, context = prepared
+        parts = [Message(role="system", content=[TextPart(text=direction).mark_as_temp()])]
+        if context:
+            parts.append(Message(role="user", content=[TextPart(text=context).mark_as_temp()]))
+        # Append only our own temporary input. Native task prompts, history,
+        # and content from other plugins remain owned by their producers.
+        run_context.messages.extend(parts)
+        run.injected_contexts.append(run_context)
+        logger.info(
+            f"[OnCue][GLANCE] 原生 Agent 开始: job={run.job_id} | "
+            f"补充上下文={len(context)}字符 | 图片模式={self._image_mode()}"
+        )
+
+    @filter.on_llm_tool_respond()
+    async def observe_glance_tool(self, event: AstrMessageEvent, tool, tool_args, tool_result):
+        run = self.native_tasks.owned_run(event)
+        if run is None:
+            return
+        name = getattr(tool, "name", "unknown")
+        failed = getattr(tool_result, "isError", None)
+        logger.info(
+            f"[OnCue][GLANCE] 原生工具返回: job={run.job_id} | tool={name} | "
+            f"isError={failed} | 送达状态未确认"
+        )
 
     @filter.on_llm_request()
     async def inject_stage_direction(self, event: AstrMessageEvent, req: ProviderRequest):
@@ -1359,6 +1468,17 @@ class OnCuePlugin(Star):
                 event.stop_event()
                 return
         self._check_context_conflict(event)
+        add_stage_direction(req, self._reply_direction(decision))
+        prepared = await self._prepare_reply_context(event, decision, req)
+        if prepared is None:
+            async with chat.lock:
+                self._discard_decision(event, chat)
+            event.stop_event()
+            return
+        context, direct_images = prepared
+        set_temporary_background(req, context, TextPart, images=direct_images, image_part_type=ImageURLPart)
+
+    def _reply_direction(self, decision) -> str:
         speaker = decision.get("speaker", "").strip()
         mood = decision.get("mood", "").strip()
         if self._cfg_bool("enable_speaker_routing", False) and speaker:
@@ -1371,8 +1491,11 @@ class OnCuePlugin(Star):
         kb_text = str(decision.get("kb_text", "") or "").strip()
         if kb_text:
             line += f"\n[知识库]\n{kb_text}\n结合角色性格自然使用，不要提及本指令。"
-        add_stage_direction(req, line)
+        return line
+
+    async def _prepare_reply_context(self, event, decision, req):
         context = ""
+        direct_images = []
         snapshot = decision.get("_chat_context")
         if isinstance(snapshot, ContextSnapshot):
             target = decision.get("_target")
@@ -1404,17 +1527,13 @@ class OnCuePlugin(Star):
                         self._terminating or not self._cfg_bool("enable", True)
                         or ("_reply_version" in decision and decision["_reply_version"] != chat.reply_version)
                     ):
-                        self._discard_decision(event, chat)
-                        event.stop_event()
-                        return
+                        return None
             context = request_background(
                 working, event, req, target=target, include_history=True,
             )
             if not include_history and target is None and not any(row.image_body for row in working.rows):
                 context = ""
-            set_temporary_background(req, context, TextPart, images=direct_images, image_part_type=ImageURLPart)
-        else:
-            set_temporary_background(req, context, TextPart)
+        return context, direct_images
 
     @filter.on_decorating_result()
     async def mark_streaming_reply_sent(self, event: AstrMessageEvent):

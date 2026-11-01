@@ -133,7 +133,7 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.plugin.glance_last_check[self.chat_id], 1)
         self.assertFalse(self.chat.lock.locked())
 
-    async def test_successful_reply_does_not_make_old_activity_new_again(self):
+    async def test_completed_task_does_not_make_old_activity_new_again(self):
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
         await self.plugin._glance_due(self.chat_id)
         self.assertEqual(self.plugin.glance_last_check[self.chat_id], 2)
@@ -152,35 +152,55 @@ class GlanceTests(unittest.IsolatedAsyncioTestCase):
         self.plugin._llm_decision.assert_awaited_once()
         self.assertEqual(list(self.chat.reply_ts), [])
 
-    async def test_native_tool_delivery_without_final_hook_is_counted_once(self):
+    async def test_task_completion_and_private_send_markers_do_not_count_as_delivery(self):
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
 
-        async def native(event):
-            event._has_send_oper = True
-            event.set_extra("_send_message_to_user_current_session_plain_texts", ["工具发出的正文"])
+        async def native(trigger, *, is_current):
+            # A completed native task and implementation-private metadata are
+            # not public delivery receipts for the plugin's accounting.
+            trigger._has_send_oper = True
+            trigger.set_extra("_send_message_to_user_current_session_plain_texts", ["工具发出的正文"])
+            trigger.set_extra("task_summary", "已完成群聊接话任务")
 
-        self.plugin._run_native_reply.side_effect = native
+        self.plugin.native_tasks.run.side_effect = native
         await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(list(self.chat.reply_ts), [self.now])
-        self.assertEqual(self.chat.messages[-1]["text"], "工具发出的正文")
+        self.assertEqual(list(self.chat.reply_ts), [])
+        self.assertEqual([row["role"] for row in self.chat.messages], ["user", "user"])
+        self.assertFalse(self.plugin._is_observing(self.chat, self.now))
         self.assertEqual(self.chat.pending_replies, {})
 
-    async def test_partial_delivery_is_counted_even_if_pipeline_later_fails(self):
+    async def test_failed_task_releases_reservation_without_fabricating_a_reply(self):
         self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
 
-        async def native(event):
-            from test_timing import Plain
-            event._has_send_oper = True
-            event.delivered = [Plain("已送达的第一段")]
-            raise RuntimeError("later segment failed")
+        async def native(trigger, *, is_current):
+            trigger.set_extra("task_summary", "任务未完成")
+            raise RuntimeError("native task failed")
 
-        self.plugin._run_native_reply.side_effect = native
-        with self.assertRaisesRegex(RuntimeError, "later segment failed"):
+        self.plugin.native_tasks.run.side_effect = native
+        with self.assertRaisesRegex(RuntimeError, "native task failed"):
             await self.plugin._glance_due(self.chat_id)
-        self.assertEqual(list(self.chat.reply_ts), [self.now])
-        self.assertEqual(self.chat.messages[-1]["text"], "已送达的第一段")
+        self.assertEqual(list(self.chat.reply_ts), [])
+        self.assertEqual([row["role"] for row in self.chat.messages], ["user", "user"])
         self.assertEqual(self.chat.pending_replies, {})
         self.assertFalse(self.chat.glance_inflight)
+
+    async def test_cancelled_native_task_releases_reservation_and_reschedules(self):
+        self.plugin._llm_decision.return_value = '{"should_reply": true, "reason": "topic"}'
+        self.plugin.native_tasks.run.side_effect = asyncio.CancelledError()
+
+        with self.assertRaises(asyncio.CancelledError):
+            await self.plugin._glance_due(self.chat_id)
+
+        self.assertEqual(self.chat.pending_replies, {})
+        self.assertFalse(self.chat.glance_inflight)
+        self.assertFalse(self.chat.lock.locked())
+        self.assertEqual(list(self.chat.reply_ts), [])
+        self.assertIn(self.chat_id, self.plugin.glance_next_due)
+
+    async def test_silent_decision_does_not_start_a_native_task(self):
+        await self.plugin._glance_due(self.chat_id)
+        self.plugin.native_tasks.run.assert_not_awaited()
+        self.assertEqual(self.chat.pending_replies, {})
 
 
 if __name__ == "__main__":

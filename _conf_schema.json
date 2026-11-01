@@ -147,7 +147,7 @@
         "description": "启用定时一瞥 (GLANCE)",
         "type": "bool",
         "default": true,
-        "hint": "随机间隔瞄一眼群聊，由角色决定是否搭话。任务会持久化到 AstrBot 的 data 目录"
+        "hint": "随机检查群聊，决策通过后由原生未来任务执行；普通回复的表情替换等处理不自动适用"
       },
       "glance_min_minutes": {
         "description": "一瞥最小间隔（分）",

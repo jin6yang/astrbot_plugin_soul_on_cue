@@ -232,7 +232,7 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(self.chat.reply_ts), [])
         self.assertFalse(self.chat.decision_inflight)
 
-    async def test_started_glance_send_does_not_block_summons_and_still_gets_recorded(self):
+    async def test_started_native_task_send_is_not_guessed_to_be_confirmed(self):
         self.plugin._llm_decision.return_value = REPLY
         entered, release = self.block(self.plugin.context.send_message, True)
         task = self.start(self.plugin._glance_due(self.chat_id))
@@ -241,8 +241,8 @@ class ConcurrencyTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.wait_for(self.plugin.on_message(_event(summoned=True)), 1)
         release.set()
         await task
-        self.assertEqual(len(self.chat.reply_ts), 1)
-        self.assertEqual(self.chat.messages[-1]["text"], "glance reply")
+        self.assertEqual(len(self.chat.reply_ts), 0)
+        self.assertNotEqual(self.chat.messages[-1]["text"], "glance reply")
         self.plugin.native_history.assert_awaited_once()
 
     async def test_glance_history_write_does_not_hold_chat_lock(self):
